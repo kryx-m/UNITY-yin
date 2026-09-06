@@ -1,0 +1,11 @@
+#!/bin/sh
+
+while read local_ref local_sha remote_ref remote_sha
+do
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        echo "Direct pushes to main are blocked. Push a codex/* branch and merge through a reviewed pull request." >&2
+        exit 1
+    fi
+done
+
+exit 0
