@@ -55,7 +55,7 @@ function Get-RepoSafetyConfig {
 
 function Assert-CleanRepository {
     param([Parameter(Mandatory = $true)][string]$Repository)
-    $changes = Invoke-Git -Repository $Repository -Arguments @("status", "--porcelain")
+    $changes = @(Invoke-Git -Repository $Repository -Arguments @("status", "--porcelain"))
     if ($changes.Count -gt 0) {
         $detail = $changes -join [Environment]::NewLine
         throw "Repository has uncommitted changes and will not be touched: $Repository$([Environment]::NewLine)$detail"
