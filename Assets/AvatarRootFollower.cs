@@ -84,7 +84,8 @@ public class AvatarRootFollower : MonoBehaviour
     {
         if (Input.GetKeyDown(recalibrateKey))
         {
-            if (_hasEstimator)
+            // 仅在 Python 标定激活后允许重校（避免未标定时从零锚点）
+            if (_hasEstimator && rootEstimator.isCalibrated)
                 rootEstimator.Calibrate();
         }
     }
@@ -100,10 +101,7 @@ public class AvatarRootFollower : MonoBehaviour
             return;
         }
 
-        // ── 1. 从 Root 估计器获取位移 ──
-        Vector3 delta = rootEstimator.rootDelta;  // 世界坐标位移（m）
-
-        // ── 2. 速度平滑 ──
+        // ── 1. 从 Root 估计器获取速度（m/s，已按 UDP 包时间计算）──
         Vector3 targetVel;
         float targetSpeed;
 
@@ -115,18 +113,9 @@ public class AvatarRootFollower : MonoBehaviour
         }
         else
         {
-            // delta 是每帧位移 → 转换为瞬时速度
-            float dt = Time.deltaTime;
-            if (dt > 0.001f)
-            {
-                targetVel = delta / dt;
-                targetSpeed = targetVel.magnitude;
-            }
-            else
-            {
-                targetVel = Vector3.zero;
-                targetSpeed = 0f;
-            }
+            targetVel = rootEstimator.rootVelocity;
+            targetVel.y = 0f;
+            targetSpeed = targetVel.magnitude;
 
             // 速度上限
             if (targetSpeed > maxSpeed)
@@ -196,7 +185,7 @@ public class AvatarRootFollower : MonoBehaviour
 
         L($"🎯 v16  Root 估计驱动 [{_status}]"); y += 2;
         L("══ ⚙️ DualCameraRootEstimator ══");
-        L($"  delta=({rootEstimator.rootDelta.x:F2}, {rootEstimator.rootDelta.z:F2})");
+        L($"  vel=({rootEstimator.rootVelocity.x:F2}, {rootEstimator.rootVelocity.z:F2}) m/s");
         L($"  rawDX={rootEstimator.rawDX:+0.0000;-0.0000}  rawDZ={rootEstimator.rawDZ:+0.0000;-0.0000}");
         L("══ 🏃 移动 ══");
         L($"  速度={_currentSpeed:F2} m/s  vel=({_velocity.x:F2}, {_velocity.z:F2})");

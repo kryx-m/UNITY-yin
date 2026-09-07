@@ -854,12 +854,9 @@ MonoBehaviour:
   receiver: {fileID: 765940728}
   leftReceiver: {fileID: 2000000001}
   targetAnimator: {fileID: 1379038807}
-  legBaseWeight: 0.5
-  armBaseWeight: 0.3
-  minVisibility: 0.3
+  legBlendWeight: 0.5
+  disableBodyRotation: 0
   enableBodyRotation: 1
-  invertBodyForward: 0
-  disableBodyRotation: 1
   bodyRotationSmooth: 8
   enableHeadRotation: 1
   headRotationSmooth: 10
