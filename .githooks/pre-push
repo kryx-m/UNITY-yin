@@ -8,4 +8,9 @@ do
     fi
 done
 
-exit 0
+if ! command -v git-lfs >/dev/null 2>&1; then
+    echo "Git LFS is required for this repository. Install it before pushing." >&2
+    exit 2
+fi
+
+git lfs pre-push "$@"
