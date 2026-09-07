@@ -41,20 +41,37 @@ if (-not $Wip) {
     $unityArgs = @(
         "-batchmode",
         "-nographics",
-        "-projectPath", [string]$state.unityWorktree,
+        "-projectPath", ('"' + [string]$state.unityWorktree + '"'),
         "-runTests",
         "-testPlatform", "EditMode",
-        "-testResults", $unityResults,
-        "-logFile", $unityLog
+        "-testResults", ('"' + $unityResults + '"'),
+        "-logFile", ('"' + $unityLog + '"')
     )
     $unityProcess = Start-Process -FilePath $config.unityExe -ArgumentList $unityArgs -Wait -PassThru -WindowStyle Hidden
     if ($unityProcess.ExitCode -ne 0) {
         throw "Unity validation failed with exit code $($unityProcess.ExitCode). See $unityLog"
     }
+    if (-not (Test-Path -LiteralPath $unityResults -PathType Leaf)) {
+        throw "Unity validation did not create a test result file. See $unityLog"
+    }
+    [xml]$unityTestRun = Get-Content -Raw -LiteralPath $unityResults
+    if ([string]$unityTestRun.'test-run'.result -ne "Passed") {
+        throw "Unity EditMode tests did not pass. See $unityResults"
+    }
 
     & $config.pythonExe -m compileall -q ([string]$state.pythonWorktree)
     if ($LASTEXITCODE -ne 0) {
         throw "Python compileall validation failed."
+    }
+    Push-Location ([string]$state.pythonWorktree)
+    try {
+        & $config.pythonExe -c "import pose_estimation_dual, mocap_app, calibration_gui"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python import smoke validation failed."
+        }
+    }
+    finally {
+        Pop-Location
     }
     $testsPath = Join-Path ([string]$state.pythonWorktree) "tests"
     if (Test-Path -LiteralPath $testsPath -PathType Container) {
