@@ -860,7 +860,7 @@ MonoBehaviour:
   maxTimeDiff: 0.1
   minLandmarkVisibility: 0.3
   enableBodyRotation: 1
-  invertBodyForward: 1
+  invertBodyForward: 0
   bodyRotationSmooth: 8
   enableHeadRotation: 1
   headRotationSmooth: 10
@@ -966,6 +966,8 @@ MonoBehaviour:
   maxDeltaPerFrame: 3
   calibrateKey: 99
   autoCalibrateOnStart: 1
+  invertRootX: 0
+  invertRootZ: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

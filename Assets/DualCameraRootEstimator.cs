@@ -34,6 +34,12 @@ public class DualCameraRootEstimator : MonoBehaviour
     [Tooltip("单包最大位移(m)，超过归零")]
     public float maxDeltaPerFrame = 3f;
 
+    [Header("Direction Correction")]
+    [Tooltip("左右(前摄 world X)位移方向反了时勾选，立即翻转")]
+    public bool invertRootX = false;
+    [Tooltip("前后(左摄 world Z)位移方向反了时勾选，立即翻转")]
+    public bool invertRootZ = false;
+
     [Header("Calibration")]
     public KeyCode calibrateKey = KeyCode.C;
     public bool autoCalibrateOnStart = true;
@@ -204,7 +210,9 @@ public class DualCameraRootEstimator : MonoBehaviour
         _smoothVelZ = Mathf.Lerp(_smoothVelZ, velZ, lowPassAlpha);
 
         // ── 6. 输出 ──
-        rootVelocity = new Vector3(_smoothVelX, 0f, _smoothVelZ);
+        rootVelocity = new Vector3(
+            invertRootX ? -_smoothVelX : _smoothVelX, 0f,
+            invertRootZ ? -_smoothVelZ : _smoothVelZ);
     }
 
     /// <summary>
