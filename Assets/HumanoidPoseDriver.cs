@@ -76,6 +76,11 @@ public class HumanoidPoseDriver : MonoBehaviour
     public float RightKneeAngleDeg { get; private set; }
     public bool SquatDataValid { get; private set; }
     public bool SquatReachLimited { get; private set; }
+    public string SquatFailReason { get; private set; } = "";
+    public float LeftLegConfidence { get; private set; }
+    public float RightLegConfidence { get; private set; }
+    public string SquatLimitReason { get; private set; } = "";
+    public bool SquatPaused { get; private set; }
 
     [Header("Debug")]
     public bool showBoneWarnings = true;
@@ -111,6 +116,11 @@ public class HumanoidPoseDriver : MonoBehaviour
     private float _leftThighLen, _leftShinLen, _rightThighLen, _rightShinLen;
     private float _leftKneeDeg, _rightKneeDeg;
     private Vector3 _lastPlannedL, _lastPlannedR;   // 上一帧已投影的计划脚位(判近地)
+    private bool _plannedValid;                     // 是否已有有效计划脚位(非初始零)
+    private float _leftConf, _rightConf;            // 左右腿置信度(分腿)
+    private float _squatInvalidTime;                // 有效新帧之外累计的无效时长(s)
+    private float _recoverTimer;                    // 恢复平滑(200ms)
+    private bool _wasInvalid;                       // 上次是否处于无效/暂停
 
     private class BoneRig
     {
@@ -344,11 +354,19 @@ public class HumanoidPoseDriver : MonoBehaviour
         PlannedLeftAnkle  = _leftUpperLegRig.bone != null ? PlannedLeftAnkle : Vector3.zero;
         PlannedRightAnkle = _rightUpperLegRig.bone != null ? PlannedRightAnkle : Vector3.zero;
 
-        // ── 下蹲：识别站立基准 → 目标下降量 → 平滑 → 应用骨盆(仅脚 IK 生效时) ──
+        // ── 下蹲：识别站立基准 → 目标下降量（仅新帧）→ 每帧平滑 → 应用骨盆（仅脚 IK 生效时）──
         if (footIKActive)
         {
-            UpdateSquat(frontPose, Time.deltaTime);
-            ApplyPelvisOffset(Time.deltaTime);
+            UpdateSquat(frontPose); // 测量：仅有效新帧更新目标下降量
+            if (enableSquat)
+            {
+                SmoothAndApplySquat(Time.deltaTime);
+            }
+            else
+            {
+                SquareFailWhenDisabled();
+                RestoreHipsToBase();
+            }
             // 应用骨盆后再投影独立踝位（FootPlantingController 读到骨盆修正后的脚位）
             PlannedLeftAnkle = FKProjectAnkle(_leftUpperLegRig, _leftLowerLegRig,
                                               LeftUpperPlanned, LeftLowerPlanned, _leftFootRig);
@@ -356,10 +374,11 @@ public class HumanoidPoseDriver : MonoBehaviour
                                                RightUpperPlanned, RightLowerPlanned, _rightFootRig);
             _lastPlannedL = PlannedLeftAnkle;
             _lastPlannedR = PlannedRightAnkle;
+            _plannedValid = true;
         }
         else
         {
-            // 脚 IK 关闭 → 下蹲同步退出，恢复骨盆基准高度
+            // 脚 IK 关闭 → 下蹲控制同步退出，恢复骨盆基准高度
             RestoreHipsToBase();
         }
 
@@ -499,7 +518,8 @@ public class HumanoidPoseDriver : MonoBehaviour
     // ══════════════════════════════════════════════════════════════
 
     /// <summary>识别站立基准 + 计算目标下降量（仅有效新帧更新；渲染帧只平滑）。</summary>
-    void UpdateSquat(Dictionary<string, Landmark> pose, float dt)
+    /// <summary>测量（仅有效新帧更新目标下降量；渲染帧不重置）。</summary>
+    void UpdateSquat(Dictionary<string, Landmark> pose)
     {
         bool validData = false;
         double frameDt = 0;
@@ -514,97 +534,122 @@ public class HumanoidPoseDriver : MonoBehaviour
                     validData = true;
                     frameDt = now - _squatPrevTime;
                 }
+                else
+                {
+                    _standTime = 0d; // 时间戳倒退/重置 → 清空候选计时
+                }
                 _squatPrevTime = now;
                 _squatLastFrameId = recv.LatestFrameId;
             }
         }
 
-        // 双膝可见度（前摄关键点 23,25,27 / 24,26,28）
-        float vis = float.MaxValue;
-        foreach (var k in new[] { "23", "25", "27", "24", "26", "28" })
-        {
-            if (pose.TryGetValue(k, out var lm)) vis = Mathf.Min(vis, lm.visibility);
-            else { vis = 0f; break; }
-        }
+        // 分腿置信度（左右腿独立）
+        float lc = 1f, rc = 1f;
+        foreach (var k in new[] { "23", "25", "27" }) { if (pose.TryGetValue(k, out var lm)) lc = Mathf.Min(lc, lm.visibility); else { lc = 0f; break; } }
+        foreach (var k in new[] { "24", "26", "28" }) { if (pose.TryGetValue(k, out var lm)) rc = Mathf.Min(rc, lm.visibility); else { rc = 0f; break; } }
+        _leftConf = lc; _rightConf = rc;
+        LeftLegConfidence = lc; RightLegConfidence = rc;
+        LeftKneeAngleDeg = _leftKneeDeg; RightKneeAngleDeg = _rightKneeDeg;
 
-        // 用“上一帧已投影”的计划脚位判接近地面（当前帧的 Planned* 在投影前为 0）
-        bool nearGround = (_lastPlannedL.y - boardY) <= 0.30f && (_lastPlannedR.y - boardY) <= 0.30f;
-        bool standing = vis >= squatMinVisibility &&
-                        _leftKneeDeg >= squatKneeAngleMin &&
-                        _rightKneeDeg >= squatKneeAngleMin &&
-                        nearGround;
+        // 接地：必须已有有效计划脚位（不采用初始零计划位）
+        bool nearGround = _plannedValid &&
+            (_lastPlannedL.y - boardY) <= 0.30f && (_lastPlannedR.y - boardY) <= 0.30f;
 
-        if (validData)
-            _standTime = standing ? _standTime + frameDt : 0d;
-        SquatDataValid = validData && vis >= squatMinVisibility;
+        bool kneeOk = _leftKneeDeg >= squatKneeAngleMin && _rightKneeDeg >= squatKneeAngleMin;
+        bool visOk = lc >= squatMinVisibility && rc >= squatMinVisibility;
+        bool standing = kneeOk && visOk && nearGround;
 
-        // 建立基准（连续满足 0.6s，且仅一次；不随动作自动更新）
+        SquatFailReason = "";
+        if (!kneeOk) SquatFailReason = "膝角不足(需≥" + squatKneeAngleMin.ToString("F0") + "°)";
+        else if (!visOk) SquatFailReason = "可见度不足(需≥" + squatMinVisibility.ToString("F2") + ")";
+        else if (!nearGround) SquatFailReason = "双脚未稳定接地";
+
+        SquatDataValid = validData && (lc >= 0.30f || rc >= 0.30f);
+        if (validData) _standTime = standing ? _standTime + frameDt : 0d;
+
         if (!_squatBaselineEstablished && _standTime >= squatRecognizeTime && standing)
         {
             _H0 = (_leftH + _rightH) * 0.5f;
             _squatBaselineEstablished = true;
             _smoothDescent = 0f;
             _squatTargetDescent = 0f;
-            Debug.Log("[Squat] ✅ 站立基准已建立.");
+            _squatInvalidTime = 0f; _recoverTimer = 0f; _wasInvalid = false;
+            Debug.Log("[Squat] 站立基准已建立.");
         }
         BaselineEstablished = _squatBaselineEstablished;
-        LeftKneeAngleDeg = _leftKneeDeg;
-        RightKneeAngleDeg = _rightKneeDeg;
 
-        // 计算目标下降量
         if (_squatBaselineEstablished && SquatDataValid)
         {
-            float avgLegLen = (_leftThighLen + _leftShinLen + _rightThighLen + _rightShinLen) * 0.25f;
+            // 平均腿长 = (左大腿+左小腿+右大腿+右小腿) / 2
+            float avgLegLen = (_leftThighLen + _leftShinLen + _rightThighLen + _rightShinLen) * 0.5f;
             float maxDescent = Mathf.Max(0.01f, avgLegLen * squatMaxDescentRatio);
-
-            bool leftOk = vis >= 0.30f;
-            bool rightOk = vis >= 0.30f;
-            float target = 0f;
-            if (leftOk && rightOk)
+            bool dual = lc >= 0.30f && rc >= 0.30f;
+            float target;
+            SquatLimitReason = "";
+            if (dual)
             {
                 float dL = _H0 - _leftH;
                 float dR = _H0 - _rightH;
-                // 置信度加权（双支撑，均有效）
-                float wL = Mathf.Clamp01(vis);
-                float wR = Mathf.Clamp01(vis);
+                float wL = Mathf.Clamp01(lc), wR = Mathf.Clamp01(rc);
                 target = (dL * wL + dR * wR) / Mathf.Max(1e-4f, wL + wR);
             }
             else
             {
                 // 单脚迈步/抬腿：保持已有下降量，不把抬膝当蹲
                 target = _smoothDescent;
+                SquatLimitReason = "单脚支撑，保持高度";
             }
             target = Mathf.Clamp(target, 0f, maxDescent);
-
-            // 死区
             if (target < squatDeadzone) target = 0f;
-
-            // 平滑目标（时间常数）
-            float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.01f, squatSmoothTimeConst));
-            float smoothed = Mathf.Lerp(_smoothDescent, target, a);
-
-            // 升降速度上限
-            float maxStep = squatMaxSpeed * dt;
-            _smoothDescent = Mathf.MoveTowards(_smoothDescent, smoothed, maxStep);
             _squatTargetDescent = target;
         }
-        else
+        else if (!_squatBaselineEstablished)
         {
             _squatTargetDescent = 0f;
         }
-        DescentMeters = Mathf.Max(0f, _smoothDescent);
+        // 否则：保持上一个 _squatTargetDescent（重复帧不重置为 0）
+
+        // 无效时长/暂停/恢复
+        if (validData) _squatInvalidTime = 0f;
+        else _squatInvalidTime += Time.deltaTime;
+        SquatPaused = _squatBaselineEstablished && _squatInvalidTime > 0.25f;
+        if (SquatPaused) _wasInvalid = true;
+        else if (_wasInvalid) { _recoverTimer = 0.2f; _wasInvalid = false; }
+        if (_recoverTimer > 0f) _recoverTimer = Mathf.Max(0f, _recoverTimer - Time.deltaTime);
     }
 
-    /// <summary>将骨盆 Hips 沿世界竖直方向下移（单写入者；不逐帧累加；不修改根/旋转）。</summary>
-    void ApplyPelvisOffset(float dt)
+    /// <summary>每渲染帧：向缓存目标平滑，随后应用骨盆位置。</summary>
+    void SmoothAndApplySquat(float dt)
     {
-        if (!_hipsBaseCaptured || _hips == null) return;
         if (_squatBaselineEstablished)
         {
-            Vector3 worldDown = Vector3.down;
-            Vector3 parentDown = _hipsParent != null ? _hipsParent.InverseTransformDirection(worldDown) : worldDown;
-            Vector3 targetLocal = _hipsBaseLocalPos + parentDown * DescentMeters;
-            _hips.localPosition = targetLocal;
+            if (!SquatPaused)
+            {
+                float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.01f, squatSmoothTimeConst));
+                float smoothed = Mathf.Lerp(_smoothDescent, _squatTargetDescent, a);
+                float maxStep = squatMaxSpeed * dt;
+                _smoothDescent = Mathf.MoveTowards(_smoothDescent, smoothed, maxStep);
+            }
+            // 恢复(200ms)由时间常数平滑自然完成；暂停时保持最后安全高度
+        }
+        else
+        {
+            _smoothDescent = 0f;
+        }
+        DescentMeters = Mathf.Max(0f, _smoothDescent);
+        ApplyPelvisOffset();
+    }
+
+    /// <summary>将骨盘 Hips 沿世界竖直方向下移（单写入者；从基准局部位置计算，不逐帧累加；修正父缩放）。</summary>
+    void ApplyPelvisOffset()
+    {
+        if (!_hipsBaseCaptured || _hips == null || _hipsParent == null) return;
+        if (_squatBaselineEstablished)
+        {
+            // 目标世界位置 = 基准世界位置 + 世界向下 × DescentMeters → 转回父局部（正确处理父缩放/旋转/平移）
+            Vector3 baseWorld = _hipsParent.TransformPoint(_hipsBaseLocalPos);
+            Vector3 targetWorld = baseWorld + Vector3.down * DescentMeters;
+            _hips.localPosition = _hipsParent.InverseTransformPoint(targetWorld);
         }
         else
         {
@@ -612,13 +657,19 @@ public class HumanoidPoseDriver : MonoBehaviour
         }
     }
 
+    void SquareFailWhenDisabled()
+    {
+        SquatTargetDescent = 0f;
+        DescentMeters = 0f;
+        SquatPaused = false;
+        SquatLimitReason = "下蹲已关闭";
+    }
+
     void RestoreHipsToBase()
     {
         if (!_hipsBaseCaptured || _hips == null) return;
         _hips.localPosition = _hipsBaseLocalPos;
     }
-
-    /// <summary>Inspector 按钮：重新识别站立基准（清空基准与计时）。</summary>
     public void ReidentifyStandingBaseline()
     {
         _squatBaselineEstablished = false;

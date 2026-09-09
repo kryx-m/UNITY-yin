@@ -60,6 +60,10 @@ public class FootPlantingController : MonoBehaviour
     [Header("Diagnostics")]
     public bool showOverlay = true;
     public bool logDiagnostics = false;
+    [Tooltip("只读：本帧是否触发腿部不可达")]
+    public bool reachLimited;
+    [Tooltip("只读：可达限制原因")]
+    public string reachReason = "";
 
     // 骨骼
     private Transform _hips, _lUp, _lLo, _lFoot, _lToe, _rUp, _rLo, _rFoot, _rToe;
@@ -108,7 +112,6 @@ public class FootPlantingController : MonoBehaviour
 
     private float _frontAgeMs = float.PositiveInfinity;
     private readonly string _session = System.Guid.NewGuid().ToString("N");
-    private int _seq;
 
     // ── 结构化诊断快照（供 FootIkUdpSender / Python 回传）──
     public struct FootDiag
@@ -144,7 +147,7 @@ public class FootPlantingController : MonoBehaviour
     {
         var s = new Snapshot();
         s.session = _session;
-        s.seq = ++_seq;
+        s.seq = 0; // 序号由发送端每次发送递增
         s.ikEnabled = enableFootIK;
         s.controllerEnabled = enabled;
         s.frontAgeMs = _frontAgeMs;
@@ -269,6 +272,8 @@ public class FootPlantingController : MonoBehaviour
 
         SolveFoot(ref _l, poseDriver.PlannedLeftAnkle, true);
         SolveFoot(ref _r, poseDriver.PlannedRightAnkle, false);
+        reachLimited = _l.unreach || _r.unreach;
+        reachReason = reachLimited ? "腿部不可达" : "";
 
         if (logDiagnostics && Time.frameCount % 30 == 0)
             Debug.Log($"[FootIK] age={_frontAgeMs:F0}ms | L:[{Diag(_l)}] | R:[{Diag(_r)}]");
@@ -462,7 +467,9 @@ public class FootPlantingController : MonoBehaviour
         st.unreach = clamped;
         st.distToAnchor = st.hasAnchor ? Vector3.Distance(foot.position, st.anchor) : 0f;
 
-        RestoreFootFlat(foot, toe, footRest, footFwdLocal, footUpLocal);
+        // 支撑脚施加接地朝向；摆动脚保持计划姿态朝向（不强制水平）
+        if (st.hasAnchor && st.planted >= 0.5f)
+            RestoreFootFlat(foot, toe, footRest, footFwdLocal, footUpLocal);
     }
 
     float MedianY(FootState st)
