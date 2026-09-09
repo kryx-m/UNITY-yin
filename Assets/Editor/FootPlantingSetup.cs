@@ -103,4 +103,35 @@ public static class FootPlantingSetup
         Debug.Log("[Squat] 已触发重新识别站立基准（请站直 0.6s）。");
         EditorUtility.DisplayDialog("Squat", "已触发重新识别站立基准。\n请站直并保持约 0.6 秒（依赖有效新数据帧累计）。", "确定");
     }
+
+    [MenuItem("Mocap/Add Foot IK UDP Sender")]
+    public static void AddFootIkUdpSender()
+    {
+        var ctrl = Object.FindObjectOfType<FootPlantingController>();
+        if (ctrl == null)
+        {
+            EditorUtility.DisplayDialog("Foot IK UDP", "场景中没有 FootPlantingController，请先运行 Mocap → Setup Foot Planting。", "确定");
+            return;
+        }
+        var sender = Object.FindObjectOfType<FootIkUdpSender>();
+        Scene scene = ctrl.gameObject.scene;
+        if (sender == null)
+        {
+            var go = new GameObject("FootIkUdpSender");
+            go.transform.SetParent(null);
+            scene = go.scene;
+            sender = go.AddComponent<FootIkUdpSender>();
+        }
+        sender.controller = ctrl;
+        sender.host = "127.0.0.1";
+        sender.port = 8890;
+        sender.sendHz = 10f;
+        if (scene.IsValid())
+        {
+            EditorSceneManager.MarkSceneDirty(scene);
+            EditorSceneManager.SaveScene(scene);
+        }
+        Debug.Log("[FootIkUdp] 已添加/更新 FootIkUdpSender（127.0.0.1:8890, 10Hz）并保存，已自动关联脚锁控制器。");
+        EditorUtility.DisplayDialog("Foot IK UDP", "已添加 FootIkUdpSender 并保存。\nUnity 会持续向 127.0.0.1:8890 每秒 10 次回传脚锁诊断。\n请同时确认 Python 桌面监看窗口已打开。", "确定");
+    }
 }

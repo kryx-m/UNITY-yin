@@ -107,6 +107,87 @@ public class FootPlantingController : MonoBehaviour
     private const int CandBuffer = 16;
 
     private float _frontAgeMs = float.PositiveInfinity;
+    private readonly string _session = System.Guid.NewGuid().ToString("N");
+    private int _seq;
+
+    // ── 结构化诊断快照（供 FootIkUdpSender / Python 回传）──
+    public struct FootDiag
+    {
+        public bool hasAnchor;
+        public int anchorId;
+        public float planted;
+        public bool releasing;
+        public string status;        // zh: 支撑/释放/摆动
+        public string releaseReason; // zh: 抬脚/持续上升/迈步偏离/锚点不可达/—/支撑
+        public float liftRise;       // m
+        public float anchorDev;      // m
+        public float hipToAnchor;    // m
+        public float ankleToAnchor;  // m
+        public float vSpeed;         // m/s
+        public bool unreach;
+        public float unreachTimeAcc; // s
+        public bool contact;
+    }
+    public struct Snapshot
+    {
+        public string session;
+        public int seq;
+        public bool ikEnabled;
+        public bool controllerEnabled;
+        public float frontAgeMs;
+        public bool published;      // 是否已发布过(有数据)
+        public FootDiag left;
+        public FootDiag right;
+    }
+
+    public Snapshot GetDiagnostics()
+    {
+        var s = new Snapshot();
+        s.session = _session;
+        s.seq = ++_seq;
+        s.ikEnabled = enableFootIK;
+        s.controllerEnabled = enabled;
+        s.frontAgeMs = _frontAgeMs;
+        s.published = animator != null && animator.isHuman && poseDriver != null;
+        s.left = BuildFootDiag(_l);
+        s.right = BuildFootDiag(_r);
+        return s;
+    }
+
+    FootDiag BuildFootDiag(FootState st)
+    {
+        var d = new FootDiag();
+        d.hasAnchor = st.hasAnchor;
+        d.anchorId = st.anchorId;
+        d.planted = st.planted;
+        d.releasing = st.releasing;
+        d.liftRise = st.liftRise;
+        d.anchorDev = st.anchorDev;
+        d.hipToAnchor = st.anchorDist;
+        d.ankleToAnchor = st.distToAnchor;
+        d.vSpeed = st.vSpeed;
+        d.unreach = st.unreach;
+        d.unreachTimeAcc = st.unreachTimeAcc;
+        d.contact = st.contact;
+        if (st.releasing) { d.status = "释放"; d.releaseReason = ZhReason(st.releaseReason); }
+        else if (st.hasAnchor) { d.status = st.planted >= 0.5f ? "支撑" : "释放中"; d.releaseReason = "支撑"; }
+        else { d.status = "摆动"; d.releaseReason = "—"; }
+        return d;
+    }
+
+    static string ZhReason(string r)
+    {
+        switch (r)
+        {
+            case "lifted": return "抬脚";
+            case "liftedV": return "持续上升";
+            case "step": return "迈步偏离";
+            case "stuck": return "锚点不可达";
+            case "sliding": return "滑移";
+            case "none": return "支撑";
+            default: return "—";
+        }
+    }
 
     void Awake()
     {
