@@ -42,6 +42,18 @@ public class HumanoidPoseDriver : MonoBehaviour
     public bool enableFingerRotation = true;
     public float fingerRotationSmooth = 14f;
 
+    [Header("Foot IK (3rd-party)")]
+    [Tooltip("为 true 时，腿部 FK 只计算并暴露“独立计划值”，不直接写显示骨；由 FootPlantingController 接管腿部")]
+    public bool footIKActive = false;
+
+    // 独立 FK 计划值（不受 IK 污染）：FootPlantingController 读取作为“期望脚位”来源
+    public Vector3 PlannedLeftAnkle;
+    public Vector3 PlannedRightAnkle;
+    public Quaternion LeftUpperPlanned, LeftLowerPlanned;
+    public Quaternion RightUpperPlanned, RightLowerPlanned;
+    public Quaternion LeftFootPlanned, RightFootPlanned;
+    public bool LeftFootPlannedValid, RightFootPlannedValid;
+
     [Header("Debug")]
     public bool showBoneWarnings = true;
 
@@ -268,17 +280,128 @@ public class HumanoidPoseDriver : MonoBehaviour
 
         ApplyLimbRigDual(_leftUpperArmRig,  _leftLowerArmRig,  frontPose, leftPose, "11", "13", "15", 0.3f);
         ApplyLimbRigDual(_rightUpperArmRig, _rightLowerArmRig, frontPose, leftPose, "12", "14", "16", 0.3f);
-        ApplyLimbRigDual(_leftUpperLegRig,  _leftLowerLegRig,  frontPose, leftPose, "23", "25", "27", legBlendWeight);
-        ApplyLimbRigDual(_rightUpperLegRig, _rightLowerLegRig, frontPose, leftPose, "24", "26", "28", legBlendWeight);
+
+        // ── 腿部：footIKActive 时只计算“独立 FK 计划值”，不写显示骨（交给 FootPlantingController）──
+        HandleLeg(_leftUpperLegRig,  _leftLowerLegRig,  frontPose, leftPose, "23", "25", "27", legBlendWeight,
+                  isLeftFoot: true,  ref PlannedLeftAnkle,  ref LeftUpperPlanned,  ref LeftLowerPlanned);
+        HandleLeg(_rightUpperLegRig, _rightLowerLegRig, frontPose, leftPose, "24", "26", "28", legBlendWeight,
+                  isLeftFoot: false, ref PlannedRightAnkle, ref RightUpperPlanned, ref RightLowerPlanned);
+        PlannedLeftAnkle  = _leftUpperLegRig.bone != null ? PlannedLeftAnkle : Vector3.zero;
+        PlannedRightAnkle = _rightUpperLegRig.bone != null ? PlannedRightAnkle : Vector3.zero;
+
+        if (!footIKActive)
+        {
+            // 脚部回正：仅在非 IK 时由本驱动写入；IK 模式下由 FootPlantingController 负责小腿后恢复脚朝向
+            ApplyFootRigDual(frontPose, leftPose, true, legBlendWeight);
+            ApplyFootRigDual(frontPose, leftPose, false, legBlendWeight);
+        }
 
         if (enableFingerRotation)
         {
             ApplyHandAndFingers(frontPose, true);
             ApplyHandAndFingers(frontPose, false);
         }
+    }
 
-        ApplyFootRigDual(frontPose, leftPose, true, legBlendWeight);
-        ApplyFootRigDual(frontPose, leftPose, false, legBlendWeight);
+    /// <summary>
+    /// 处理单条腿。foreIKActive 时：计算方向的加权结果 → 目标局部旋转 →（若脚 IK 开启）仅投影出“独立踝位”不写骨；
+    /// 否则照旧写入 FK。
+    /// </summary>
+    void HandleLeg(BoneRig upperRig, BoneRig lowerRig,
+        Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
+        string a, string b, string c, float leftWeight, bool isLeftFoot,
+        ref Vector3 plannedAnkle, ref Quaternion upperPlanned, ref Quaternion lowerPlanned)
+    {
+        GetLegDirs(front, left, a, b, c, leftWeight, out Vector3 dirUpper, out Vector3 dirLower);
+
+        Quaternion upperTarget = ComputeBoneRigTarget(upperRig, dirUpper);
+        Quaternion lowerTarget = ComputeBoneRigTarget(lowerRig, dirLower);
+        upperPlanned = upperTarget;
+        lowerPlanned = lowerTarget;
+
+        if (footIKActive)
+        {
+            // 只投影“独立踝位”，绝不写骨 → 反馈闭环切断
+            plannedAnkle = FKProjectAnkle(upperRig, lowerRig, upperTarget, lowerTarget,
+                                          isLeftFoot ? _leftFootRig : _rightFootRig);
+            return;
+        }
+
+        ApplyBoneRig(upperRig, dirUpper, rotationSmooth);
+        ApplyBoneRig(lowerRig, dirLower, rotationSmooth);
+    }
+
+    /// <summary>求一条腿的 上/下 世界方向（前摄 + 左摄加权），不写骨。方向分量会被归一化。</summary>
+    void GetLegDirs(Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
+        string a, string b, string c, float leftWeight, out Vector3 dirUpper, out Vector3 dirLower)
+    {
+        dirUpper = Vector3.zero;
+        dirLower = Vector3.zero;
+        bool fOk = front != null && LandmarksPresent(front, a, b, c);
+        bool lOk = left != null && LandmarksUsable(left, a, b, c);
+        float totalW = 0f;
+
+        if (fOk)
+        {
+            Vector3 p1 = CoordinateConverter.ToUnityWorld(front[a]);
+            Vector3 p2 = CoordinateConverter.ToUnityWorld(front[b]);
+            Vector3 p3 = CoordinateConverter.ToUnityWorld(front[c]);
+            float w = 1f - leftWeight;
+            dirUpper += (p2 - p1).normalized * w;
+            dirLower += (p3 - p2).normalized * w;
+            totalW += w;
+        }
+        if (lOk)
+        {
+            Vector3 p1 = CoordinateConverter.ToUnityWorldLeft(left[a]);
+            Vector3 p2 = CoordinateConverter.ToUnityWorldLeft(left[b]);
+            Vector3 p3 = CoordinateConverter.ToUnityWorldLeft(left[c]);
+            dirUpper += (p2 - p1).normalized * leftWeight;
+            dirLower += (p3 - p2).normalized * leftWeight;
+            totalW += leftWeight;
+        }
+        if (dirUpper.sqrMagnitude > 1e-6f) dirUpper.Normalize();
+        if (dirLower.sqrMagnitude > 1e-6f) dirLower.Normalize();
+    }
+
+    /// <summary>
+    /// 用“计划 FK 局部旋转”正向运动学投影出独立踝位。
+    /// 使用髋(上腿.parent)当前旋转（未被腿 IK 改写）+ 计划旋转 + 骨段长度，不读显示骨当前值。
+    /// </summary>
+    Vector3 FKProjectAnkle(BoneRig upperRig, BoneRig lowerRig,
+        Quaternion upperTarget, Quaternion lowerTarget, BoneRig footRig)
+    {
+        Transform up = upperRig.bone, low = lowerRig.bone;
+        if (up == null || low == null) return Vector3.zero;
+
+        Quaternion upParentRot = up.parent != null ? up.parent.rotation : Quaternion.identity;
+        Quaternion upWorldRot = upParentRot * upperTarget;
+        Vector3 hipPos = up.position;                              // 髋关节（由根+身体旋转决定，非腿IK）
+        Vector3 kneeWorld = hipPos + upWorldRot * low.localPosition;   // 膝偏移在 upper 自身局部空间
+        Quaternion lowWorldRot = upWorldRot * lowerTarget;
+        Vector3 ankleLocal = footRig != null && footRig.bone != null
+            ? footRig.bone.localPosition
+            : low.localPosition;
+        Vector3 ankleWorld = kneeWorld + lowWorldRot * ankleLocal;
+        return ankleWorld;
+    }
+
+    /// <summary>返回目标局部旋转（不写骨）；等价 ApplyBoneRig 中的 targetLocalRot。</summary>
+    Quaternion ComputeBoneRigTarget(BoneRig rig, Vector3 targetDirWorld)
+    {
+        if (rig?.bone == null || targetDirWorld.sqrMagnitude < 1e-6f)
+            return rig != null ? rig.restLocalRotation : Quaternion.identity;
+
+        Vector3 desiredParentDir = rig.bone.parent != null
+            ? rig.bone.parent.InverseTransformDirection(targetDirWorld.normalized)
+            : targetDirWorld.normalized;
+        if (desiredParentDir.sqrMagnitude < 1e-6f) return rig.restLocalRotation;
+
+        Vector3 restParentDir = rig.restLocalRotation * rig.restAxisLocal;
+        if (restParentDir.sqrMagnitude < 1e-6f) return rig.restLocalRotation;
+
+        Quaternion delta = Quaternion.FromToRotation(restParentDir.normalized, desiredParentDir.normalized);
+        return delta * rig.restLocalRotation;
     }
 
     // ══════════════════════════════════════════════════════════════

@@ -345,6 +345,9 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: c4e1bd3184f15764b8adb8a1c7fd5dc4, type: 3}
       insertIndex: -1
       addedObject: {fileID: 999900001}
+    - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: c4e1bd3184f15764b8adb8a1c7fd5dc4, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 1379038810}
     - targetCorrespondingSourceObject: {fileID: -4728426434207774260, guid: c4e1bd3184f15764b8adb8a1c7fd5dc4, type: 3}
       insertIndex: -1
       addedObject: {fileID: 1249548577}
@@ -867,7 +870,46 @@ MonoBehaviour:
   rotationSmooth: 10
   enableFingerRotation: 1
   fingerRotationSmooth: 14
+  footIKActive: 1
+  PlannedLeftAnkle: {x: 0, y: 0, z: 0}
+  PlannedRightAnkle: {x: 0, y: 0, z: 0}
+  LeftUpperPlanned: {x: 0, y: 0, z: 0, w: 0}
+  LeftLowerPlanned: {x: 0, y: 0, z: 0, w: 0}
+  RightUpperPlanned: {x: 0, y: 0, z: 0, w: 0}
+  RightLowerPlanned: {x: 0, y: 0, z: 0, w: 0}
+  LeftFootPlanned: {x: 0, y: 0, z: 0, w: 0}
+  RightFootPlanned: {x: 0, y: 0, z: 0, w: 0}
+  LeftFootPlannedValid: 0
+  RightFootPlannedValid: 0
   showBoneWarnings: 1
+--- !u!114 &1379038810
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1379038805}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2977f19ab3a317b42a1f2ad28923e55d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  enableFootIK: 1
+  animator: {fileID: 1379038807}
+  poseDriver: {fileID: 1379038808}
+  boardY: 0
+  ankleOffset: 0.08
+  plantHeightMax: 0.3
+  plantSpeedMax: 0.5
+  exitSpeedMax: 0.9
+  liftSpeedThreshold: 0.3
+  plantEntryRate: 8
+  plantExitRate: 3.5
+  minPlantTime: 0.12
+  reachMargin: 0.002
+  footRotateSmooth: 30
+  showOverlay: 1
+  logDiagnostics: 0
 --- !u!1 &2000000000
 GameObject:
   m_ObjectHideFlags: 0
@@ -964,10 +1006,10 @@ MonoBehaviour:
   lowPassAlpha: 0.25
   deadZoneMeters: 0.005
   maxDeltaPerFrame: 3
-  calibrateKey: 99
-  autoCalibrateOnStart: 1
   invertRootX: 0
   invertRootZ: 1
+  calibrateKey: 99
+  autoCalibrateOnStart: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

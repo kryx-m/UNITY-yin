@@ -60,6 +60,18 @@ public class UdpPoseReceiver : MonoBehaviour
             return new Dictionary<string, Landmark>(s.landmarks);
         }
     }
+
+    // ── 帧龄（本地单调时间，用于发现断流/陈旧；非“摄像头到显示”的端到端延迟）──
+    private float _lastPacketRealtime = -1f;
+    public float LatestPacketAgeMs
+    {
+        get
+        {
+            if (_lastPacketRealtime < 0f) return float.PositiveInfinity;
+            return Mathf.Max(0f, (Time.realtimeSinceStartup - _lastPacketRealtime) * 1000f);
+        }
+    }
+    public bool HasReceivedAny => _lastPacketRealtime >= 0f;
     public struct FrameEntry
     {
         public double time; public int frameId;
@@ -100,6 +112,7 @@ public class UdpPoseReceiver : MonoBehaviour
         if (newSnap != null)
         {
             lock (_cacheLock) { _cached = newSnap; }
+            _lastPacketRealtime = Time.realtimeSinceStartup;
         }
     }
 
