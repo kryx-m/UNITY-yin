@@ -1,16 +1,15 @@
 using UnityEngine;
 
 /// <summary>
-/// Stage A (修正版 v2) — 脚锁 + 直解两骨腿 IK。
+/// Stage A (修正版 v3) — 脚锁 + 直解两骨腿 IK。
 ///
-/// v2 修正（吸收评审意见，仅改本文件）：
-///  A1) 锚点生命周期：接触候选期(近地+慢+不抬)用有效新帧的多帧平均建锚，anchorId 递增；
-///      支持相锚点不动；只在释放权重降到 0 时才清锚（不会中途删掉正在参与混合的锚）。
-///  A2) 放脚去抖：轻微异常用短去抖(以有效新帧时间差累计)；明确抬升/滑移立即快速放。
-///  A3) 膝方向缓存：重投影到当前腿轴垂直平面，退化时保留连续方向（避免膝/腿翻转）。
-///  A4) 摆动期按时间常数低通计划踝位（alpha=1-exp(-dt/tc)），不同帧率下一致。
-///  A5) 不可达：先求投影后的 clampedTarget，膝与小腿都用同一 clampedTarget（不同名不一致）。
-///  A6) 诊断：数据帧龄、contact、planted、anchorId、释放原因、脚到锚点距离(无锚显示不适用)、垂速、不可达。
+/// v3 变更（吸收评审意见，仅改本文件）：
+///  1) plantBaseY = 接触候选期“有效计划踝位 Y”的中值；anchor.y = 板面+踝偏移。抬升量用 plantBaseY，贴地目标用 anchor.y。
+///  2) 抬脚 = 相对基准抬升(>riseThreshold, 默认0.14m) 立即快速放；速度路径需“小幅实际抬升 + 短时连续证据”，防孤立速度尖峰。
+///  3) 不可达 = 检查“髋→锁定锚点”距离(非已投影IK目标)，超真实腿长 + 容差(2cm)，持续(0.15s)才放。
+///  4) 释放是完整状态(releasing)：进入后持续降权到0，中途不因重新满足支撑而回升；清锚时清空候选统计，下次必须重新接触确认。
+///  5) 姿态无效/断流/时间戳重置：不累计锁放计时（只在有效前进的新帧计时）。
+///  另提供“应用修正版释放参数”菜单，更新 Inspector 里缓存的旧默认值。
 /// </summary>
 [DefaultExecutionOrder(150)]
 public class FootPlantingController : MonoBehaviour
@@ -26,25 +25,37 @@ public class FootPlantingController : MonoBehaviour
     public float boardY = 0f;
     public float ankleOffset = 0.08f;
 
-    [Header("Stance (per effective data frame)")]
-    public float plantHeightMax = 0.28f;      // 踝世界Y-板面 ≤ 此值 → 近地候选
-    public float plantSpeedMax = 0.45f;       // 水平速度 ≤ 此值 → 慢
-    public float exitSpeedMax = 0.85f;        // 超过且不低 → 视为滑移(脱离)
-    public float clearLiftHeight = 0.42f;     // 踝世界Y-板面 > 此值 → 明确离地(高度抗噪声,立即放)
-    public float minPlantTime = 0.10f;        // 接触候选最短持续(有效新帧时间)
-    public float swingDebounce = 0.06f;       // 轻微滑移的短去抖(有效新帧时间)
+    [Header("Stance (contact candidate)")]
+    public float plantHeightMax = 0.20f;   // 踝世界Y-板面 ≤ 此值 → 近地候选
+    public float plantSpeedMax = 0.25f;    // 水平速度 ≤ 此值 → 慢
+    public float minPlantTime = 0.10f;     // 接触候选最短持续(有效新帧时间)
+
+    [Header("Release: lift (relative to plant base)")]
+    public float riseThreshold = 0.14f;    // 相对 plantBaseY 抬升超过 → 明确抬脚(立即放)
+    public float liftVSpeed = 0.25f;       // 向上速度(需结合小幅抬升+连续证据)
+    public float vEvidenceRise = 0.03f;    // 速度路径需要的最小抬升
+    public float vEvidenceTime = 0.06f;    // 速度路径连续证据时长(有效新帧)
+
+    [Header("Release: low-step deviation")]
+    public float stepDev = 0.15f;          // 独立目标相对锚点水平偏离超过 → 低位迈步释放
+    public float stepDevTime = 0.06f;      // 偏离持续(有效新帧)
+
+    [Header("Release: stuck (anchor unreachable)")]
+    public float unreachTolerance = 0.02f; // 超出腿可达的容差(不超过此不判不可达)
+    public float unreachTime = 0.15f;      // 不可达持续(有效新帧)
+
+    [Header("Rates")]
     public float plantEntryRate = 10f;
-    public float plantExitRateNormal = 20f;   // 滑移脱离
-    public float plantExitRateFast = 80f;     // 明确抬升,立即放
+    public float plantExitRateFast = 80f;  // 明确抬脚/不可达等:快速放
 
     [Header("Smoothing")]
-    public float swingLowpassTimeConst = 0.05f; // 摆动期计划踝位低通时间常数(秒)
+    public float swingLowpassTimeConst = 0.05f;
     public float reachMargin = 0.002f;
     public float footRotateSmooth = 30f;
 
     [Header("Speed deadzone")]
-    public float hSpeedDeadzone = 0.05f;      // 水平速度低于此视为静止
-    public float vSpeedDeadzone = 0.05f;      // 垂直速度死区(小噪声不算抬脚)
+    public float hSpeedDeadzone = 0.05f;
+    public float vSpeedDeadzone = 0.05f;
 
     [Header("Diagnostics")]
     public bool showOverlay = true;
@@ -61,28 +72,39 @@ public class FootPlantingController : MonoBehaviour
 
     private struct FootState
     {
-        public bool hasAnchor;
-        public Vector3 anchor;
+        public bool hasAnchor;         // 是否已锁定(进入支撑)
+        public Vector3 anchor;         // 锁定锚点(y=板面+踝偏移)
+        public float plantBaseY;       // 接触候选期计划踝位Y的中值(抬升基准)
         public int anchorId;
-        public float planted;         // 0=摆动 1=完全支撑(钉住锚点)
+        public float planted;          // 0..1 支撑权重
+        public bool releasing;         // 完整释放状态:一旦true持续降权到0,中途不回升
+        public string releaseReason;   // lifted/liftedV/step/stuck/none/--
         public bool smoothInit;
-        public Vector3 smoothPlan;    // 低通后的计划踝位(摆动跟踪用)
+        public Vector3 smoothPlan;
         public bool init;
-        public Vector3 prevPlan;      // 上一数据帧计划踝位(算速度)
+        public Vector3 prevPlan;
         public double prevTime;
         public int lastFrameId;
         public float hSpeed, vSpeed;
-        public float candTime;        // 接触候选持续(有效新帧时间)
+        // 接触候选统计
+        public float candTime;
         public double candSumX, candSumZ;
         public int candCount;
-        public float swingTime;       // 轻微滑移去抖(有效新帧时间)
-        public Vector3 polePerp;      // 缓存的膝极值方向
+        public float[] candYs;         // 计划踝位Y 环形缓冲(取中值)
+        public int candYHead;          // 下一个写入位置
+        // 释放证据计时(有效新帧)
+        public float vEvidTime;
+        public float stepDevTimeAcc;
+        public float unreachTimeAcc;
+        // 诊断
+        public float liftRise, anchorDev, anchorDist;
         public bool unreach;
-        public bool contact;          // 诊断
-        public string releaseReason;  // 诊断: lifted/sliding/none/--
-        public float distToAnchor;    // 诊断: 解算后脚踝->锚点距离
+        public bool contact;
+        public float distToAnchor;
+        public Vector3 polePerp;
     }
     private FootState _l, _r;
+    private const int CandBuffer = 16;
 
     private float _frontAgeMs = float.PositiveInfinity;
 
@@ -135,6 +157,8 @@ public class FootPlantingController : MonoBehaviour
         s.lastFrameId = -1;
         s.planted = 0f;
         s.releaseReason = "--";
+        s.candYs = new float[CandBuffer];
+        s.candYHead = 0;
     }
 
     void CacheBone(Transform bone, Transform child, out Quaternion rest, out Vector3 axis)
@@ -171,6 +195,7 @@ public class FootPlantingController : MonoBehaviour
 
     string Diag(FootState s) =>
         $"plant={s.planted:F2} anchor={s.anchorId} contact={s.contact} rel={s.releaseReason} " +
+        $"rise={s.liftRise:F2} dev={s.anchorDev:F2} adist={s.anchorDist:F2} " +
         $"dist={(s.hasAnchor ? s.distToAnchor.ToString("F3") : "-")} v={s.vSpeed:+0.00;-0.00} unreach={s.unreach}";
 
     void SolveFoot(ref FootState st, Vector3 rawPlan, bool isLeft)
@@ -190,16 +215,17 @@ public class FootPlantingController : MonoBehaviour
         Vector3 footUpLocal = isLeft ? _lFootUpLocal : _rFootUpLocal;
 
         float dt = Mathf.Max(Time.deltaTime, 1e-4f);
-        double now = 0;
         bool newFrame = false;
+        bool validFrame = false;
         float effDt = dt;
 
         var recv = poseDriver.receiver;
         if (recv != null && recv.LatestFrameId != st.lastFrameId)
         {
-            now = recv.LatestTime;
-            if (st.init && st.lastFrameId >= 0 && now > st.prevTime && now - st.prevTime > 1e-4)
+            double now = recv.LatestTime;
+            if (st.lastFrameId >= 0 && now > st.prevTime && now - st.prevTime > 1e-4)
             {
+                validFrame = true;
                 float fr = (float)(1.0 / (now - st.prevTime));
                 Vector3 dH = new Vector3(rawPlan.x - st.prevPlan.x, 0f, rawPlan.z - st.prevPlan.z);
                 st.hSpeed = dH.magnitude * fr;
@@ -217,14 +243,14 @@ public class FootPlantingController : MonoBehaviour
             st.hSpeed = (new Vector3(rawPlan.x - st.prevPlan.x, 0f, rawPlan.z - st.prevPlan.z)).magnitude / dt;
             st.vSpeed = (rawPlan.y - st.prevPlan.y) / dt;
             st.prevPlan = rawPlan;
+            validFrame = true;
             newFrame = true;
         }
 
-        // 速度死区
         if (st.hSpeed < hSpeedDeadzone) st.hSpeed = 0f;
         if (Mathf.Abs(st.vSpeed) < vSpeedDeadzone) st.vSpeed = 0f;
 
-        // 低通计划踝位（摆动跟踪用，时间常数）
+        // 低通计划踝位（仅显示/摆动跟踪）
         if (!st.smoothInit) { st.smoothPlan = rawPlan; st.smoothInit = true; }
         else
         {
@@ -235,11 +261,10 @@ public class FootPlantingController : MonoBehaviour
         float footH = rawPlan.y - boardY;
         bool low = footH <= plantHeightMax;
         bool slow = st.hSpeed <= plantSpeedMax;
-        bool liftedHigh = footH > clearLiftHeight;   // 明确离地（高度信号，抗单帧速度噪声）
-        bool candidate = low && slow && !liftedHigh;
-        st.contact = candidate;
+        bool candidate = low && slow;
 
-        if (newFrame)
+        // ── 候选统计（仅有效新帧）──
+        if (newFrame && validFrame)
         {
             if (candidate)
             {
@@ -247,85 +272,136 @@ public class FootPlantingController : MonoBehaviour
                 st.candSumX += rawPlan.x;
                 st.candSumZ += rawPlan.z;
                 st.candCount++;
+                st.candYs[st.candYHead] = rawPlan.y;
+                st.candYHead = (st.candYHead + 1) % CandBuffer;
             }
             else
             {
                 st.candTime = 0f;
                 st.candSumX = st.candSumZ = 0;
                 st.candCount = 0;
+                st.candYHead = 0;
             }
         }
 
         // ── 锚点生命周期 ──
         if (!st.hasAnchor)
         {
-            // 接触候选满足最短时间 → 建新锚（anchorId 递增），用候选期平均落点
-            if (st.candTime >= minPlantTime && candidate && st.candCount > 0)
+            if (!st.releasing && st.candTime >= minPlantTime && candidate && st.candCount > 0)
             {
+                // plantBaseY = 候选期计划踝位Y 的中值
+                float baseY = MedianY(st);
+                st.plantBaseY = baseY;
                 st.anchor = new Vector3((float)(st.candSumX / st.candCount), boardY + ankleOffset,
                                         (float)(st.candSumZ / st.candCount));
                 st.hasAnchor = true;
                 st.anchorId++;
                 st.planted = 0f;
+                st.releasing = false;
                 st.releaseReason = "none";
+                st.vEvidTime = 0f; st.stepDevTimeAcc = 0f; st.unreachTimeAcc = 0f;
             }
             st.distToAnchor = 0f;
         }
         else
         {
-            // 明确离地(高度) → 立即快速放；滑移(水平快+不低) → 短去抖后放；否则维持支撑
-            if (liftedHigh)
+            float liftRise = rawPlan.y - st.plantBaseY;
+            float anchorDev = HorizontalLen(st.smoothPlan - st.anchor);
+            float anchorDist = Vector3.Distance(up.position, st.anchor);
+            st.liftRise = liftRise;
+            st.anchorDev = anchorDev;
+            st.anchorDist = anchorDist;
+            // 超出“真实腿长 + 容差”才判不可达（避免把站立时近伸直的腿误判为不可达）
+            float reach = thigh + shin + unreachTolerance;
+
+            if (!st.releasing)
             {
-                st.planted = Mathf.MoveTowards(st.planted, 0f, plantExitRateFast * dt);
-                st.releaseReason = "lifted";
-                st.swingTime = 0f;
-            }
-            else
-            {
-                bool fastAway = st.hSpeed > exitSpeedMax && !low;
-                if (fastAway)
+                // A) 明确抬升(相对基准) → 立即放
+                if (liftRise > riseThreshold)
                 {
-                    st.swingTime += effDt;
-                    st.releaseReason = "sliding";
-                    if (st.swingTime >= swingDebounce)
-                        st.planted = Mathf.MoveTowards(st.planted, 0f, plantExitRateNormal * dt);
+                    st.releasing = true;
+                    st.releaseReason = "lifted";
+                }
+                // D) 持续不可达(针对锚点,含容差) → 放
+                else if (anchorDist > reach)
+                {
+                    st.unreachTimeAcc += effDt;
+                    if (st.unreachTimeAcc >= unreachTime) { st.releasing = true; st.releaseReason = "stuck"; }
                 }
                 else
                 {
-                    st.swingTime = 0f;
-                    st.releaseReason = "none";
-                    st.planted = Mathf.MoveTowards(st.planted, 1f, plantEntryRate * dt);
+                    st.unreachTimeAcc = 0f;
+                    // B) 向上速度 + 小幅实际抬升 + 连续证据
+                    if (st.vSpeed > liftVSpeed && liftRise > vEvidenceRise)
+                    {
+                        st.vEvidTime += effDt;
+                        if (st.vEvidTime >= vEvidenceTime) { st.releasing = true; st.releaseReason = "liftedV"; }
+                    }
+                    else st.vEvidTime = Mathf.Max(0f, st.vEvidTime - effDt);
+
+                    // C) 低位迈步释放(独立目标偏离锚点)
+                    if (anchorDev > stepDev)
+                    {
+                        st.stepDevTimeAcc += effDt;
+                        if (st.stepDevTimeAcc >= stepDevTime) { st.releasing = true; st.releaseReason = "step"; }
+                    }
+                    else st.stepDevTimeAcc = Mathf.Max(0f, st.stepDevTimeAcc - effDt);
+
+                    if (!st.releasing)
+                    {
+                        st.releaseReason = "none";
+                        st.planted = Mathf.MoveTowards(st.planted, 1f, plantEntryRate * dt);
+                    }
                 }
             }
 
-            // 释放权重降到 0 → 清锚（下一次落脚必须重新建锚）
-            if (st.planted <= 0f)
+            // 释放状态：持续降权到0，不中途回升
+            if (st.releasing)
             {
-                st.hasAnchor = false;
-                st.planted = 0f;
-                if (st.releaseReason == "none") st.releaseReason = "none";
+                st.planted = Mathf.MoveTowards(st.planted, 0f, plantExitRateFast * dt);
+                if (st.planted <= 0f)
+                {
+                    st.hasAnchor = false;
+                    st.planted = 0f;
+                    st.releasing = false;
+                    // 清候选统计：下次必须重新接触确认
+                    st.candTime = 0f; st.candSumX = st.candSumZ = 0; st.candCount = 0; st.candYHead = 0;
+                    st.vEvidTime = 0f; st.stepDevTimeAcc = 0f; st.unreachTimeAcc = 0f;
+                    st.distToAnchor = 0f;
+                }
             }
         }
 
-        // ── 目标 = 锚点与"低通计划位"的插值（planted=1→锚；planted=0→摆动跟踪）──
+        // ── 目标 ──
         Vector3 target = st.hasAnchor
             ? Vector3.Lerp(st.smoothPlan, st.anchor, st.planted)
             : st.smoothPlan;
 
-        // 直解 IK（不可达先投影，膝/小腿用同一 clampedTarget）
-        Solve2BoneIKDirect(up, lo, target, upRest, upAxis, loRest, loAxis, thigh, shin,
-                           ref st.polePerp, out bool clamped);
+        Solve2BoneIKDirect(up, lo, target, upRest, upAxis, loRest, loAxis, thigh, shin, ref st.polePerp, out bool clamped);
         st.unreach = clamped;
-
-        // 诊断：解算后脚踝到锚点距离（无锚 = 0，显示不适用）
         st.distToAnchor = st.hasAnchor ? Vector3.Distance(foot.position, st.anchor) : 0f;
 
-        // 恢复脚朝向
         RestoreFootFlat(foot, toe, footRest, footFwdLocal, footUpLocal);
     }
 
-    /// <summary>直解两骨 IK：不可达时先把目标投影到可达范围，膝与小腿用同一投影目标。
-    /// polePerp 缓存并重投影到当前腿轴垂直平面，退化时保留连续方向。</summary>
+    float MedianY(FootState st)
+    {
+        int n = Mathf.Min(st.candCount, CandBuffer);
+        if (n <= 0) return st.prevPlan.y;
+        float[] tmp = new float[n];
+        int start = (st.candYHead - n + CandBuffer) % CandBuffer;
+        for (int i = 0; i < n; i++) tmp[i] = st.candYs[(start + i) % CandBuffer];
+        System.Array.Sort(tmp);
+        if ((n & 1) == 1) return tmp[n / 2];
+        return (tmp[n / 2 - 1] + tmp[n / 2]) * 0.5f;
+    }
+
+    static float HorizontalLen(Vector3 v)
+    {
+        v.y = 0f;
+        return v.magnitude;
+    }
+
     void Solve2BoneIKDirect(Transform up, Transform lo, Vector3 targetAnkle,
         Quaternion upRest, Vector3 upAxis, Quaternion loRest, Vector3 loAxis,
         float thigh, float shin, ref Vector3 cachedPolePerp, out bool clamped)
@@ -340,19 +416,15 @@ public class FootPlantingController : MonoBehaviour
         if (rawD > maxD + 1e-4f || rawD < minD - 1e-4f) clamped = true;
         float d = Mathf.Clamp(rawD, minD, maxD);
         Vector3 dirN = d > 1e-5f ? toTarget.normalized : Vector3.down;
-
-        // 同一投影目标：膝与小腿都用它（修正"钳制距离却解到原始目标"的不一致）
         Vector3 clampedTarget = hipPos + dirN * d;
 
         float a = (thigh * thigh - shin * shin + d * d) / (2f * d);
         float h = Mathf.Sqrt(Mathf.Max(0f, thigh * thigh - a * a));
 
-        // 膝极值：当前期望方向重投影到垂直平面 → 连续性
         Vector3 pole = _hips != null ? (_hips.rotation * _hipsForwardLocal) : Vector3.forward;
         Vector3 desired = pole - Vector3.Project(pole, dirN);
         if (desired.sqrMagnitude < 1e-6f)
         {
-            // 退化：保留缓存连续方向
             if (cachedPolePerp.sqrMagnitude < 1e-6f) desired = Vector3.Cross(dirN, Vector3.up);
             else desired = cachedPolePerp;
         }
@@ -360,14 +432,11 @@ public class FootPlantingController : MonoBehaviour
         desired = Vector3.ProjectOnPlane(desired, dirN);
         if (desired.sqrMagnitude < 1e-6f) desired = Vector3.Cross(dirN, Vector3.up);
         desired.Normalize();
-
-        // 连续性：与上一帧保持同向，避免翻转
         if (cachedPolePerp.sqrMagnitude > 1e-6f && Vector3.Dot(cachedPolePerp, desired) < 0f)
             desired = -desired;
         cachedPolePerp = desired;
 
         Vector3 kneePos = hipPos + dirN * a + desired * h;
-
         OrientBoneDirect(up, upRest, upAxis, (kneePos - hipPos).normalized);
         OrientBoneDirect(lo, loRest, loAxis, (clampedTarget - kneePos).normalized);
     }
@@ -422,14 +491,32 @@ public class FootPlantingController : MonoBehaviour
     void OnGUI()
     {
         if (!showOverlay || !enableFootIK) return;
-        float x = 10, y = 220, w = 470, lh = 15;
-        GUI.Box(new Rect(x, y, w, lh * 7 + 8), "");
+        float x = 10, y = 220, w = 500, lh = 15;
+        GUI.Box(new Rect(x, y, w, lh * 8 + 8), "");
         y += 4;
         void L(string s) { GUI.Label(new Rect(x + 6, y, w - 12, lh), s); y += lh; }
         L($"[FootIK] 数据帧龄 {(_frontAgeMs == float.PositiveInfinity ? "--" : _frontAgeMs.ToString("F0"))} ms  (非端到端延迟)");
         L($"  L: {Diag(_l)}");
         L($"  R: {Diag(_r)}");
-        L("  plant=支撑权重  anchor=锚点编号(每次换锚+1)  rel=释放原因  dist=脚->锚距(无锚=-)");
-        L($"  [空格测] 关闭EnableFootIK 对比 FK。");
+        L("  plant=支撑权重 anchor=锚点编号 rel=释放原因 rise=相对基准抬升 dev=偏离锚点 adist=髋->锚点");
+        L($"  [空格测试] 关闭EnableFootIK 对比 FK。");
+    }
+
+    /// <summary>应用修正版释放参数（用于更新场景里缓存的旧默认值）。</summary>
+    public void ApplyCorrectedParams()
+    {
+        plantHeightMax = 0.20f;
+        plantSpeedMax = 0.25f;
+        minPlantTime = 0.10f;
+        riseThreshold = 0.14f;
+        liftVSpeed = 0.25f;
+        vEvidenceRise = 0.03f;
+        vEvidenceTime = 0.06f;
+        stepDev = 0.15f;
+        stepDevTime = 0.06f;
+        unreachTolerance = 0.02f;
+        unreachTime = 0.15f;
+        vSpeedDeadzone = 0.05f;
+        hSpeedDeadzone = 0.05f;
     }
 }

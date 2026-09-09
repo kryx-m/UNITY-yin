@@ -902,12 +902,17 @@ MonoBehaviour:
   plantHeightMax: 0.3
   plantSpeedMax: 0.5
   exitSpeedMax: 0.9
-  liftSpeedThreshold: 0.3
-  plantEntryRate: 8
-  plantExitRate: 3.5
+  clearLiftHeight: 0.42
   minPlantTime: 0.12
+  swingDebounce: 0.06
+  plantEntryRate: 8
+  plantExitRateNormal: 20
+  plantExitRateFast: 80
+  swingLowpassTimeConst: 0.05
   reachMargin: 0.002
   footRotateSmooth: 30
+  hSpeedDeadzone: 0.05
+  vSpeedDeadzone: 0.05
   showOverlay: 1
   logDiagnostics: 0
 --- !u!1 &2000000000

@@ -1,10 +1,13 @@
 using UnityEngine;
 using UnityEditor;
 using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 
 /// <summary>
-/// 一键把 FootPlantingController 挂到场景中的人形角色并保存场景。
-/// 菜单：Mocap → Setup Foot Planting
+/// 一键把 FootPlantingController 挂到场景中的人形角色并保存场景；或对已有挂载应用修正版释放参数。
+/// 菜单：
+///   Mocap → Setup Foot Planting                （新建/修复挂载）
+///   Mocap → Apply Foot IK Corrected Params     （对场景已有挂载刷新为修正版默认参数，保留其余挂载/参数）
 /// </summary>
 public static class FootPlantingSetup
 {
@@ -38,16 +41,49 @@ public static class FootPlantingSetup
         ctrl.boardY = 0f;
         ctrl.ankleOffset = 0.08f;
         ctrl.showOverlay = true;
+        ctrl.ApplyCorrectedParams();
 
-        // 同步给姿态驱动，确保由脚锁接管腿部
         if (ctrl.poseDriver != null) ctrl.poseDriver.footIKActive = true;
 
         EditorSceneManager.MarkSceneDirty(animator.gameObject.scene);
         EditorSceneManager.SaveScene(animator.gameObject.scene);
 
-        Debug.Log($"[FootPlanting] 已挂载到 {animator.gameObject.name} 并保存。请停止/重开 Play 测试。");
+        Debug.Log($"[FootPlanting] 已挂载到 {animator.gameObject.name} 并保存（修正版参数）。请停止/重开 Play 测试。");
         EditorUtility.DisplayDialog("Foot Planting",
-            $"已挂载到 {animator.gameObject.name} 并保存场景。\n请停止并重新进入 Play 模式后测试（Stand / Walk / Turn）。\n可调：boardY / ankleOffset / plantHeightMax / plantSpeedMax / liftSpeedThreshold；\n画面左上角会叠加诊断（数据帧龄、planted权重、脚-锚距、垂速、不可达）。",
+            $"已挂载到 {animator.gameObject.name} 并保存，应用修正版释放参数。\n请停止并重新进入 Play 模式测试（Stand / Walk / Turn / Low-step / 快速抬脚）。\n左上角叠加诊断：plant / anchor / rel / rise / dev / adist / dist。",
+            "确定");
+    }
+
+    [MenuItem("Mocap/Apply Foot IK Corrected Params")]
+    public static void ApplyParamsToExisting()
+    {
+        var ctrls = Object.FindObjectsOfType<FootPlantingController>();
+        if (ctrls == null || ctrls.Length == 0)
+        {
+            EditorUtility.DisplayDialog("Foot Planting", "场景中没有 FootPlantingController。", "确定");
+            return;
+        }
+
+        Scene scene = default;
+        int updated = 0;
+        foreach (var c in ctrls)
+        {
+            c.ApplyCorrectedParams();
+            if (c.animator != null && c.animator.gameObject != null)
+            {
+                scene = c.animator.gameObject.scene;
+            }
+            updated++;
+        }
+        if (scene.IsValid())
+        {
+            EditorSceneManager.MarkSceneDirty(scene);
+            EditorSceneManager.SaveScene(scene);
+        }
+
+        Debug.Log($"[FootPlanting] 已对 {updated} 个 FootPlantingController 应用修正版释放参数并保存。");
+        EditorUtility.DisplayDialog("Foot Planting",
+            $"已更新 {updated} 个 FootPlantingController 的释放参数并保存场景。\n请停止 Play 后重开验证（旧默认值不会自动更新，本操作即用于覆盖它们）。",
             "确定");
     }
 }
