@@ -1,39 +1,35 @@
 using UnityEngine;
 using System.Collections.Generic;
 
-/// <summary>
-/// Humanoid 姿态驱动器 v3 — 置信度融合
-/// ======================================
-/// 核心改进：
-///   1. 可见度动态权重：摄像头看不到的关节自动降权
-///   2. 轴感知融合：前摄(XY) + 左摄(Z) 按身体部位分配合适的比例
-///   3. 手臂 30% 左摄 / 腿部 50% 左摄 / 手指纯前摄
-///
-/// 前摄: 正面，XY 精度高，Z 噪声大
-/// 左摄: 侧面，X→Unity Z 精度高，补充前后运动盲区
-/// </summary>
 public class HumanoidPoseDriver : MonoBehaviour
 {
     public UdpPoseReceiver receiver;        // 前摄 port 8888
     public UdpPoseReceiver leftReceiver;     // 左摄 port 8889
     public Animator targetAnimator;
 
-    [Header("Dual-Cam Fusion")]
-    [Tooltip("腿部左摄基础权重 (0=纯前摄, 0.5=均衡, 1=纯左摄)")]
-    [Range(0f, 1f)] public float legBaseWeight = 0.5f;
-    [Tooltip("手臂左摄基础权重")]
-    [Range(0f, 1f)] public float armBaseWeight = 0.3f;
+    [Header("Pose Source")]
+    [Tooltip("true=姿态全部用前摄(v4 单摄闭环，推荐)；false=左摄参与四肢混合(需外参标定，当前会拉低腿部质量)")]
+    public bool frontOnlyPose = true;
 
-    [Header("Confidence")]
-    [Tooltip("可见度低于此值的摄像头不参与融合")]
-    [Range(0f, 1f)] public float minVisibility = 0.3f;
+    [Header("Dual-Cam Blend")]
+    [Tooltip("左摄对腿骨的混合权重 (0=仅前摄, 0.5=平均, 1=仅左摄)")]
+    [Range(0f, 1f)] public float legBlendWeight = 0.5f;
+    [Tooltip("禁用身体旋转以单独测试 Root Motion（调试用）")]
+    public bool disableBodyRotation = false;
+
+    [Header("Sync / Gating")]
+    [Tooltip("前/左摄姿态最大允许时间差（秒），超差退化为仅前摄")]
+    public float maxTimeDiff = 0.1f;
+    [Tooltip("关键点可见度门控：低于此值的点不参与双摄混合")]
+    [Range(0f, 1f)] public float minLandmarkVisibility = 0.3f;
 
     [Header("Body")]
     public bool enableBodyRotation = true;
-    public bool invertBodyForward = false;
+    // 配合 Python FRONT_POSE_ALWAYS_SWAP：前摄翻转图 + swap 使肩线恒偏 180°，
+    // 恒翻转躯干前向恢复正确朝向（自动前后 + 人物转身）。
+    [Tooltip("翻转躯干前向：配合 Python swap 恒需 true")]
+    public bool invertBodyForward = true;
     public float bodyRotationSmooth = 8f;
-    [Tooltip("禁用身体旋转以单独测试 Root Motion（调试用）")]
-    public bool disableBodyRotation = false;
 
     [Header("Head")]
     public bool enableHeadRotation = true;
@@ -46,44 +42,91 @@ public class HumanoidPoseDriver : MonoBehaviour
     public bool enableFingerRotation = true;
     public float fingerRotationSmooth = 14f;
 
-    [Header("Bone Limits")]
-    public bool enableBoneLimits = true;
+    [Header("Foot IK (3rd-party)")]
+    [Tooltip("为 true 时，腿部 FK 只计算并暴露“独立计划值”，不直接写显示骨；由 FootPlantingController 接管腿部")]
+    public bool footIKActive = false;
+
+    // 独立 FK 计划值（不受 IK 污染）：FootPlantingController 读取作为“期望脚位”来源
+    public Vector3 PlannedLeftAnkle;
+    public Vector3 PlannedRightAnkle;
+    public Quaternion LeftUpperPlanned, LeftLowerPlanned;
+    public Quaternion RightUpperPlanned, RightLowerPlanned;
+    public Quaternion LeftFootPlanned, RightFootPlanned;
+    public bool LeftFootPlannedValid, RightFootPlannedValid;
+
+    [Header("Squat / Pelvis Height")]
+    [Tooltip("启用下蹲骨盆升降。需要 footIKActive 生效。")]
+    public bool enableSquat = true;
+    public float boardY = 0f;                      // 板面高度（骨盆/脚判定用）
+    public float squatRecognizeTime = 0.6f;        // 站立基准需持续的秒数(仅有效新帧)
+    public float squatMinVisibility = 0.65f;       // 站立识别最低关键点可见度
+    public float squatKneeAngleMin = 165f;         // 站立识别膝角下限(度)
+    [Range(0f, 0.9f)] public float squatMaxDescentRatio = 0.55f; // 最大下降 = 平均腿长 × 此值
+    public float squatSmoothTimeConst = 0.05f;     // 高度平滑时间常数(s)
+    public float squatMaxSpeed = 1.5f;             // 升降速度上限(m/s)
+    public float squatDeadzone = 0.01f;            // 高度死区(m)
+    [Tooltip("在 Inspector 勾选并手动触发一次“重新识别站立基准”")]
+    public bool reidentifyBaseline = false;
+
+    // 只读接口（供 FootPlantingController 等读取，避免各组件对同一帧不同判断）
+    public bool BaselineEstablished { get; private set; }
+    public float DescentMeters { get; private set; }
+    public float SquatTargetDescent { get; private set; }
+    public float LeftKneeAngleDeg { get; private set; }
+    public float RightKneeAngleDeg { get; private set; }
+    public bool SquatDataValid { get; private set; }
+    public bool SquatReachLimited { get; private set; }
+    public string SquatFailReason { get; private set; } = "";
+    public float LeftLegConfidence { get; private set; }
+    public float RightLegConfidence { get; private set; }
+    public string SquatLimitReason { get; private set; } = "";
+    public bool SquatPaused { get; private set; }
 
     [Header("Debug")]
     public bool showBoneWarnings = true;
+    [Header("Squat Diagnostics")]
+    public bool showSquatOverlay = true;
 
-    private Transform _hips, _spine, _chest, _upperChest, _head;
-    private Transform _leftFoot, _rightFoot;
-
+    private Transform _hips, _spine, _chest, _upperChest, _head, _leftFoot, _rightFoot;
     private Quaternion _spineRestLocalRot, _chestRestLocalRot, _upperChestRestLocalRot;
 
-    // 身体朝向平滑（减少 MediaPipe 噪声导致的旋转抖动）
-    private Vector3 _smoothBodyForward = Vector3.forward;
-    private bool _bodyForwardInitialized;
+    private BoneRig _leftUpperArmRig = new BoneRig(), _leftLowerArmRig = new BoneRig();
+    private BoneRig _rightUpperArmRig = new BoneRig(), _rightLowerArmRig = new BoneRig();
+    private BoneRig _leftUpperLegRig = new BoneRig(), _leftLowerLegRig = new BoneRig();
+    private BoneRig _rightUpperLegRig = new BoneRig(), _rightLowerLegRig = new BoneRig();
+    private BoneRig _leftFootRig = new BoneRig(), _rightFootRig = new BoneRig();
 
-    private BoneRig _leftUpperArmRig = new BoneRig();
-    private BoneRig _leftLowerArmRig = new BoneRig();
-    private BoneRig _rightUpperArmRig = new BoneRig();
-    private BoneRig _rightLowerArmRig = new BoneRig();
-    private BoneRig _leftUpperLegRig = new BoneRig();
-    private BoneRig _leftLowerLegRig = new BoneRig();
-    private BoneRig _rightUpperLegRig = new BoneRig();
-    private BoneRig _rightLowerLegRig = new BoneRig();
-    private BoneRig _leftFootRig = new BoneRig();
-    private BoneRig _rightFootRig = new BoneRig();
-
-    private BasisRig _leftHandRig = new BasisRig();
-    private BasisRig _rightHandRig = new BasisRig();
+    private BasisRig _leftHandRig = new BasisRig(), _rightHandRig = new BasisRig();
     private FingerRigChain[] _leftFingers = new FingerRigChain[5];
     private FingerRigChain[] _rightFingers = new FingerRigChain[5];
+
+    // ── squat 内部状态 ──
+    private Transform _hipsParent;
+    private Vector3 _hipsBaseLocalPos;
+    private bool _hipsBaseCaptured;
+    private double _standTime;                // 有效新帧累计站立时间
+    private int _squatLastFrameId = -1;
+    private double _squatPrevTime = -1;
+    private float _H0;                        // 站立基准的腿伸展量(每帧重算自基准姿态的H0)
+    private float _smoothDescent;
+    private float _squatTargetDescent;
+    private bool _squatBaselineEstablished;
+    private float _leftH, _rightH;
+    private Vector3 _leftThighDir, _leftShinDir, _rightThighDir, _rightShinDir;
+    private float _leftThighLen, _leftShinLen, _rightThighLen, _rightShinLen;
+    private float _leftKneeDeg, _rightKneeDeg;
+    private Vector3 _lastPlannedL, _lastPlannedR;   // 上一帧已投影的计划脚位(判近地)
+    private bool _plannedValid;                     // 是否已有有效计划脚位(非初始零)
+    private float _leftConf, _rightConf;            // 左右腿置信度(分腿)
+    private float _squatInvalidTime;                // 有效新帧之外累计的无效时长(s)
+    private float _recoverTimer;                    // 恢复平滑(200ms)
+    private bool _wasInvalid;                       // 上次是否处于无效/暂停
 
     private class BoneRig
     {
         public Transform bone;
         public Quaternion restLocalRotation;
         public Vector3 restAxisLocal = Vector3.forward;
-        public float minAngle = -180f;
-        public float maxAngle = 180f;
     }
 
     private class BasisRig
@@ -106,24 +149,14 @@ public class HumanoidPoseDriver : MonoBehaviour
         if (receiver == null)
         {
             var receivers = FindObjectsOfType<UdpPoseReceiver>();
-            foreach (var r in receivers)
-            {
-                if (r.port == 8888) { receiver = r; break; }
-            }
+            foreach (var r in receivers) { if (r.port == 8888) { receiver = r; break; } }
         }
-
         if (leftReceiver == null)
         {
             var receivers = FindObjectsOfType<UdpPoseReceiver>();
-            foreach (var r in receivers)
-            {
-                if (r.port == 8889) { leftReceiver = r; break; }
-            }
+            foreach (var r in receivers) { if (r.port == 8889) { leftReceiver = r; break; } }
         }
-
-        if (targetAnimator == null)
-            targetAnimator = GetComponent<Animator>();
-
+        if (targetAnimator == null) targetAnimator = GetComponent<Animator>();
         if (receiver == null) { Debug.LogError("❌ 没找到 UdpPoseReceiver!"); return; }
         if (targetAnimator == null) { Debug.LogError("❌ 没找到 Animator!"); return; }
         if (!targetAnimator.isHuman) { Debug.LogError("❌ 不是 Humanoid!"); return; }
@@ -132,19 +165,12 @@ public class HumanoidPoseDriver : MonoBehaviour
         CacheBones();
         targetAnimator.applyRootMotion = false;
 
-        string info = leftReceiver != null
-            ? $"双摄置信度融合 (腿={legBaseWeight:F1} 臂={armBaseWeight:F1})"
-            : "仅前摄";
-        Debug.Log($"✅ HumanoidPoseDriver v3 — {info}");
+        Debug.Log($"✅ HumanoidPoseDriver — {(leftReceiver != null ? "双摄" : "仅前摄")} legBlend={legBlendWeight:F1}");
     }
 
     void InitFingerChains()
     {
-        for (int i = 0; i < 5; i++)
-        {
-            _leftFingers[i] = new FingerRigChain();
-            _rightFingers[i] = new FingerRigChain();
-        }
+        for (int i = 0; i < 5; i++) { _leftFingers[i] = new FingerRigChain(); _rightFingers[i] = new FingerRigChain(); }
     }
 
     void CacheBones()
@@ -155,161 +181,119 @@ public class HumanoidPoseDriver : MonoBehaviour
         _upperChest = targetAnimator.GetBoneTransform(HumanBodyBones.UpperChest);
         _head = targetAnimator.GetBoneTransform(HumanBodyBones.Head);
 
+        if (_hips != null)
+        {
+            _hipsParent = _hips.parent;
+            _hipsBaseLocalPos = _hips.localPosition;
+            _hipsBaseCaptured = true;
+        }
+
         if (_spine != null) _spineRestLocalRot = _spine.localRotation;
         if (_chest != null) _chestRestLocalRot = _chest.localRotation;
         if (_upperChest != null) _upperChestRestLocalRot = _upperChest.localRotation;
 
-        CacheBoneRig(_leftUpperArmRig,  HumanBodyBones.LeftUpperArm,  HumanBodyBones.LeftLowerArm,  Vector3.forward);
-        CacheBoneRig(_leftLowerArmRig,  HumanBodyBones.LeftLowerArm,  HumanBodyBones.LeftHand,      Vector3.forward);
-        CacheBoneRig(_rightUpperArmRig, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, Vector3.forward);
-        CacheBoneRig(_rightLowerArmRig, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand,     Vector3.forward);
-
-        CacheBoneRig(_leftUpperLegRig,  HumanBodyBones.LeftUpperLeg,  HumanBodyBones.LeftLowerLeg,  Vector3.forward);
-        CacheBoneRig(_leftLowerLegRig,  HumanBodyBones.LeftLowerLeg,  HumanBodyBones.LeftFoot,      Vector3.forward);
-        CacheBoneRig(_rightUpperLegRig, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, Vector3.forward);
-        CacheBoneRig(_rightLowerLegRig, HumanBodyBones.RightLowerLeg, HumanBodyBones.RightFoot,     Vector3.forward);
-
-        // 骨骼限制
-        SetBoneLimit(_leftUpperArmRig,  0f, 180f); SetBoneLimit(_leftLowerArmRig,  0f, 180f);
-        SetBoneLimit(_rightUpperArmRig, 0f, 180f); SetBoneLimit(_rightLowerArmRig, 0f, 180f);
-        SetBoneLimit(_leftUpperLegRig,  0f, 160f); SetBoneLimit(_leftLowerLegRig,  0f, 160f);
-        SetBoneLimit(_rightUpperLegRig, 0f, 160f); SetBoneLimit(_rightLowerLegRig, 0f, 160f);
+        CacheBoneRig(_leftUpperArmRig,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftUpperArm),  targetAnimator.GetBoneTransform(HumanBodyBones.LeftLowerArm),  Vector3.forward);
+        CacheBoneRig(_leftLowerArmRig,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftLowerArm),  targetAnimator.GetBoneTransform(HumanBodyBones.LeftHand),      Vector3.forward);
+        CacheBoneRig(_rightUpperArmRig, targetAnimator.GetBoneTransform(HumanBodyBones.RightUpperArm), targetAnimator.GetBoneTransform(HumanBodyBones.RightLowerArm), Vector3.forward);
+        CacheBoneRig(_rightLowerArmRig, targetAnimator.GetBoneTransform(HumanBodyBones.RightLowerArm), targetAnimator.GetBoneTransform(HumanBodyBones.RightHand),     Vector3.forward);
+        CacheBoneRig(_leftUpperLegRig,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftUpperLeg),  targetAnimator.GetBoneTransform(HumanBodyBones.LeftLowerLeg),  Vector3.forward);
+        CacheBoneRig(_leftLowerLegRig,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftLowerLeg),  targetAnimator.GetBoneTransform(HumanBodyBones.LeftFoot),      Vector3.forward);
+        CacheBoneRig(_rightUpperLegRig, targetAnimator.GetBoneTransform(HumanBodyBones.RightUpperLeg), targetAnimator.GetBoneTransform(HumanBodyBones.RightLowerLeg), Vector3.forward);
+        CacheBoneRig(_rightLowerLegRig, targetAnimator.GetBoneTransform(HumanBodyBones.RightLowerLeg), targetAnimator.GetBoneTransform(HumanBodyBones.RightFoot),     Vector3.forward);
 
         _leftFoot  = targetAnimator.GetBoneTransform(HumanBodyBones.LeftFoot);
         _rightFoot = targetAnimator.GetBoneTransform(HumanBodyBones.RightFoot);
         CacheBoneRig(_leftFootRig,  _leftFoot,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftToes),  Vector3.forward);
         CacheBoneRig(_rightFootRig, _rightFoot, targetAnimator.GetBoneTransform(HumanBodyBones.RightToes), Vector3.forward);
 
-        // 手指
-        CacheFinger(_leftFingers,  true);
-        CacheFinger(_rightFingers, false);
+        // 左手手指
+        CacheBoneRig(_leftFingers[0].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftThumbProximal), targetAnimator.GetBoneTransform(HumanBodyBones.LeftThumbIntermediate), Vector3.forward);
+        CacheBoneRig(_leftFingers[0].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.LeftThumbIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.LeftThumbDistal), _leftFingers[0].proximal.restAxisLocal);
+        CacheBoneRig(_leftFingers[0].distal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftThumbDistal), null, _leftFingers[0].intermediate.restAxisLocal);
+        CacheBoneRig(_leftFingers[1].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftIndexProximal), targetAnimator.GetBoneTransform(HumanBodyBones.LeftIndexIntermediate), Vector3.forward);
+        CacheBoneRig(_leftFingers[1].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.LeftIndexIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.LeftIndexDistal), _leftFingers[1].proximal.restAxisLocal);
+        CacheBoneRig(_leftFingers[1].distal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftIndexDistal), null, _leftFingers[1].intermediate.restAxisLocal);
+        CacheBoneRig(_leftFingers[2].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftMiddleProximal), targetAnimator.GetBoneTransform(HumanBodyBones.LeftMiddleIntermediate), Vector3.forward);
+        CacheBoneRig(_leftFingers[2].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.LeftMiddleIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.LeftMiddleDistal), _leftFingers[2].proximal.restAxisLocal);
+        CacheBoneRig(_leftFingers[2].distal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftMiddleDistal), null, _leftFingers[2].intermediate.restAxisLocal);
+        CacheBoneRig(_leftFingers[3].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftRingProximal), targetAnimator.GetBoneTransform(HumanBodyBones.LeftRingIntermediate), Vector3.forward);
+        CacheBoneRig(_leftFingers[3].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.LeftRingIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.LeftRingDistal), _leftFingers[3].proximal.restAxisLocal);
+        CacheBoneRig(_leftFingers[3].distal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftRingDistal), null, _leftFingers[3].intermediate.restAxisLocal);
+        CacheBoneRig(_leftFingers[4].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftLittleProximal), targetAnimator.GetBoneTransform(HumanBodyBones.LeftLittleIntermediate), Vector3.forward);
+        CacheBoneRig(_leftFingers[4].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.LeftLittleIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.LeftLittleDistal), _leftFingers[4].proximal.restAxisLocal);
+        CacheBoneRig(_leftFingers[4].distal, targetAnimator.GetBoneTransform(HumanBodyBones.LeftLittleDistal), null, _leftFingers[4].intermediate.restAxisLocal);
 
-        // 手掌
-        CacheHandRig(_leftHandRig,  HumanBodyBones.LeftHand,  _leftFingers);
-        CacheHandRig(_rightHandRig, HumanBodyBones.RightHand, _rightFingers);
+        // 右手手指
+        CacheBoneRig(_rightFingers[0].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.RightThumbProximal), targetAnimator.GetBoneTransform(HumanBodyBones.RightThumbIntermediate), Vector3.forward);
+        CacheBoneRig(_rightFingers[0].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.RightThumbIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.RightThumbDistal), _rightFingers[0].proximal.restAxisLocal);
+        CacheBoneRig(_rightFingers[0].distal, targetAnimator.GetBoneTransform(HumanBodyBones.RightThumbDistal), null, _rightFingers[0].intermediate.restAxisLocal);
+        CacheBoneRig(_rightFingers[1].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.RightIndexProximal), targetAnimator.GetBoneTransform(HumanBodyBones.RightIndexIntermediate), Vector3.forward);
+        CacheBoneRig(_rightFingers[1].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.RightIndexIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.RightIndexDistal), _rightFingers[1].proximal.restAxisLocal);
+        CacheBoneRig(_rightFingers[1].distal, targetAnimator.GetBoneTransform(HumanBodyBones.RightIndexDistal), null, _rightFingers[1].intermediate.restAxisLocal);
+        CacheBoneRig(_rightFingers[2].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.RightMiddleProximal), targetAnimator.GetBoneTransform(HumanBodyBones.RightMiddleIntermediate), Vector3.forward);
+        CacheBoneRig(_rightFingers[2].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.RightMiddleIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.RightMiddleDistal), _rightFingers[2].proximal.restAxisLocal);
+        CacheBoneRig(_rightFingers[2].distal, targetAnimator.GetBoneTransform(HumanBodyBones.RightMiddleDistal), null, _rightFingers[2].intermediate.restAxisLocal);
+        CacheBoneRig(_rightFingers[3].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.RightRingProximal), targetAnimator.GetBoneTransform(HumanBodyBones.RightRingIntermediate), Vector3.forward);
+        CacheBoneRig(_rightFingers[3].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.RightRingIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.RightRingDistal), _rightFingers[3].proximal.restAxisLocal);
+        CacheBoneRig(_rightFingers[3].distal, targetAnimator.GetBoneTransform(HumanBodyBones.RightRingDistal), null, _rightFingers[3].intermediate.restAxisLocal);
+        CacheBoneRig(_rightFingers[4].proximal, targetAnimator.GetBoneTransform(HumanBodyBones.RightLittleProximal), targetAnimator.GetBoneTransform(HumanBodyBones.RightLittleIntermediate), Vector3.forward);
+        CacheBoneRig(_rightFingers[4].intermediate, targetAnimator.GetBoneTransform(HumanBodyBones.RightLittleIntermediate), targetAnimator.GetBoneTransform(HumanBodyBones.RightLittleDistal), _rightFingers[4].proximal.restAxisLocal);
+        CacheBoneRig(_rightFingers[4].distal, targetAnimator.GetBoneTransform(HumanBodyBones.RightLittleDistal), null, _rightFingers[4].intermediate.restAxisLocal);
+
+        CacheHandRig(_leftHandRig,  targetAnimator.GetBoneTransform(HumanBodyBones.LeftHand),  _leftFingers[1].proximal.bone,  _leftFingers[2].proximal.bone,  _leftFingers[4].proximal.bone);
+        CacheHandRig(_rightHandRig, targetAnimator.GetBoneTransform(HumanBodyBones.RightHand), _rightFingers[1].proximal.bone, _rightFingers[2].proximal.bone, _rightFingers[4].proximal.bone);
 
         if (showBoneWarnings) WarnAll();
     }
 
-    void CacheBoneRig(BoneRig rig, HumanBodyBones bone, HumanBodyBones child, Vector3 fallback)
-    {
-        Transform t = targetAnimator.GetBoneTransform(bone);
-        rig.bone = t;
-        if (t == null) return;
-        rig.restLocalRotation = t.localRotation;
-
-        Transform c = targetAnimator.GetBoneTransform(child);
-        Vector3 axis = fallback;
-        if (c != null)
-        {
-            Vector3 d = c.localPosition;
-            if (d.sqrMagnitude < 1e-6f) d = t.InverseTransformDirection(c.position - t.position);
-            if (d.sqrMagnitude > 1e-6f) axis = d.normalized;
-        }
-        if (axis.sqrMagnitude < 1e-6f) axis = Vector3.forward;
-        rig.restAxisLocal = axis.normalized;
-    }
-
-    void CacheBoneRig(BoneRig rig, Transform bone, Transform child, Vector3 fallback)
+    void CacheBoneRig(BoneRig rig, Transform bone, Transform child, Vector3 fallbackAxisLocal)
     {
         rig.bone = bone;
         if (bone == null) return;
         rig.restLocalRotation = bone.localRotation;
-
-        Vector3 axis = fallback;
+        Vector3 axis = fallbackAxisLocal;
         if (child != null)
         {
-            Vector3 d = child.localPosition;
-            if (d.sqrMagnitude < 1e-6f) d = bone.InverseTransformDirection(child.position - bone.position);
-            if (d.sqrMagnitude > 1e-6f) axis = d.normalized;
+            Vector3 childLocalDir = child.localPosition;
+            if (childLocalDir.sqrMagnitude < 1e-6f) childLocalDir = bone.InverseTransformDirection(child.position - bone.position);
+            if (childLocalDir.sqrMagnitude > 1e-6f) axis = childLocalDir.normalized;
         }
         if (axis.sqrMagnitude < 1e-6f) axis = Vector3.forward;
         rig.restAxisLocal = axis.normalized;
     }
 
-    void CacheFinger(FingerRigChain[] chains, bool isLeft)
+    void CacheHandRig(BasisRig rig, Transform hand, Transform indexRoot, Transform middleRoot, Transform pinkyRoot)
     {
-        for (int f = 0; f < 5; f++)
-        {
-            HumanBodyBones[] bones = GetFingerBones(f, isLeft);
-            if (bones[0] == HumanBodyBones.LastBone) continue;
-            CacheBoneRig(chains[f].proximal,
-                targetAnimator.GetBoneTransform(bones[0]),
-                targetAnimator.GetBoneTransform(bones[1]), Vector3.forward);
-            CacheBoneRig(chains[f].intermediate,
-                targetAnimator.GetBoneTransform(bones[1]),
-                targetAnimator.GetBoneTransform(bones[2]), chains[f].proximal.restAxisLocal);
-            CacheBoneRig(chains[f].distal,
-                targetAnimator.GetBoneTransform(bones[2]),
-                null, chains[f].intermediate.restAxisLocal);
-        }
-    }
-
-    HumanBodyBones[] GetFingerBones(int finger, bool isLeft)
-    {
-        // 0=thumb, 1=index, 2=middle, 3=ring, 4=little
-        if (isLeft)
-        {
-            switch (finger)
-            {
-                case 0: return new[] { HumanBodyBones.LeftThumbProximal, HumanBodyBones.LeftThumbIntermediate, HumanBodyBones.LeftThumbDistal };
-                case 1: return new[] { HumanBodyBones.LeftIndexProximal, HumanBodyBones.LeftIndexIntermediate, HumanBodyBones.LeftIndexDistal };
-                case 2: return new[] { HumanBodyBones.LeftMiddleProximal, HumanBodyBones.LeftMiddleIntermediate, HumanBodyBones.LeftMiddleDistal };
-                case 3: return new[] { HumanBodyBones.LeftRingProximal, HumanBodyBones.LeftRingIntermediate, HumanBodyBones.LeftRingDistal };
-                case 4: return new[] { HumanBodyBones.LeftLittleProximal, HumanBodyBones.LeftLittleIntermediate, HumanBodyBones.LeftLittleDistal };
-            }
-        }
-        else
-        {
-            switch (finger)
-            {
-                case 0: return new[] { HumanBodyBones.RightThumbProximal, HumanBodyBones.RightThumbIntermediate, HumanBodyBones.RightThumbDistal };
-                case 1: return new[] { HumanBodyBones.RightIndexProximal, HumanBodyBones.RightIndexIntermediate, HumanBodyBones.RightIndexDistal };
-                case 2: return new[] { HumanBodyBones.RightMiddleProximal, HumanBodyBones.RightMiddleIntermediate, HumanBodyBones.RightMiddleDistal };
-                case 3: return new[] { HumanBodyBones.RightRingProximal, HumanBodyBones.RightRingIntermediate, HumanBodyBones.RightRingDistal };
-                case 4: return new[] { HumanBodyBones.RightLittleProximal, HumanBodyBones.RightLittleIntermediate, HumanBodyBones.RightLittleDistal };
-            }
-        }
-        return new[] { HumanBodyBones.LastBone };
-    }
-
-    void CacheHandRig(BasisRig rig, HumanBodyBones handBone, FingerRigChain[] fingers)
-    {
-        Transform hand = targetAnimator.GetBoneTransform(handBone);
         rig.bone = hand;
         if (hand == null) return;
         rig.restLocalRotation = hand.localRotation;
 
-        Vector3 indexDir = GetLocalDir(hand, fingers[1].proximal.bone);
-        Vector3 middleDir = GetLocalDir(hand, fingers[2].proximal.bone);
-        Vector3 pinkyDir = GetLocalDir(hand, fingers[4].proximal.bone);
+        Vector3 indexDir = GetLocalDirection(hand, indexRoot);
+        Vector3 middleDir = GetLocalDirection(hand, middleRoot);
+        Vector3 pinkyDir = GetLocalDirection(hand, pinkyRoot);
 
-        Vector3 fwd = Vector3.zero; int n = 0;
-        if (indexDir.sqrMagnitude > 1e-6f) { fwd += indexDir.normalized; n++; }
-        if (middleDir.sqrMagnitude > 1e-6f) { fwd += middleDir.normalized; n++; }
-        if (pinkyDir.sqrMagnitude > 1e-6f) { fwd += pinkyDir.normalized; n++; }
-
-        if (n == 0) { rig.restForwardLocal = Vector3.forward; rig.restUpLocal = Vector3.up; return; }
-        fwd.Normalize();
+        Vector3 forward = Vector3.zero; int count = 0;
+        if (indexDir.sqrMagnitude > 1e-6f) { forward += indexDir.normalized; count++; }
+        if (middleDir.sqrMagnitude > 1e-6f) { forward += middleDir.normalized; count++; }
+        if (pinkyDir.sqrMagnitude > 1e-6f) { forward += pinkyDir.normalized; count++; }
+        if (count == 0) { rig.restForwardLocal = Vector3.forward; rig.restUpLocal = Vector3.up; return; }
+        forward.Normalize();
 
         Vector3 up = Vector3.Cross(indexDir, pinkyDir);
         if (up.sqrMagnitude < 1e-6f) up = Vector3.up;
-        up = Vector3.ProjectOnPlane(up, fwd);
+        up = Vector3.ProjectOnPlane(up, forward);
         if (up.sqrMagnitude < 1e-6f) up = Vector3.up;
-
-        rig.restForwardLocal = fwd.normalized;
+        rig.restForwardLocal = forward.normalized;
         rig.restUpLocal = up.normalized;
     }
 
-    Vector3 GetLocalDir(Transform parent, Transform child)
+    Vector3 GetLocalDirection(Transform parent, Transform child)
     {
         if (parent == null || child == null) return Vector3.zero;
-        Vector3 d = child.localPosition;
-        if (d.sqrMagnitude < 1e-6f) d = parent.InverseTransformDirection(child.position - parent.position);
-        return d.sqrMagnitude < 1e-6f ? Vector3.zero : d.normalized;
+        Vector3 local = child.localPosition;
+        if (local.sqrMagnitude < 1e-6f) local = parent.InverseTransformDirection(child.position - parent.position);
+        return local.sqrMagnitude < 1e-6f ? Vector3.zero : local.normalized;
     }
-
-    void SetBoneLimit(BoneRig rig, float min, float max) { rig.minAngle = min; rig.maxAngle = max; }
 
     void WarnAll()
     {
@@ -320,7 +304,7 @@ public class HumanoidPoseDriver : MonoBehaviour
         WarnIfNull("LeftUpperLeg", _leftUpperLegRig.bone); WarnIfNull("LeftLowerLeg", _leftLowerLegRig.bone);
         WarnIfNull("RightUpperLeg", _rightUpperLegRig.bone); WarnIfNull("RightLowerLeg", _rightLowerLegRig.bone);
     }
-    void WarnIfNull(string n, Transform t) { if (t == null) Debug.LogWarning($"⚠️ 骨骼未映射: {n}"); }
+    void WarnIfNull(string name, Transform t) { if (t == null) Debug.LogWarning($"⚠️ 骨骼未映射: {name}"); }
 
     // ══════════════════════════════════════════════════════════════
     // 主循环
@@ -330,34 +314,81 @@ public class HumanoidPoseDriver : MonoBehaviour
     {
         if (receiver == null) return;
 
+        if (reidentifyBaseline)
+        {
+            reidentifyBaseline = false;
+            ReidentifyStandingBaseline();
+        }
+
         var frontPose = receiver.GetLatestPose();
         if (frontPose == null || frontPose.Count == 0) return;
 
         Dictionary<string, Landmark> leftPose = null;
-        bool hasLeft = leftReceiver != null;
-        if (hasLeft)
+        if (leftReceiver != null && !frontOnlyPose)
         {
-            leftPose = leftReceiver.GetLatestPose();
-            hasLeft = leftPose != null && leftPose.Count > 0;
+            // 时间匹配：取左摄中最接近前摄时间的帧；超差/空则本帧退化为仅前摄，
+            // 避免左摄卡住后旧姿态仍以固定权重混入造成重影/拉扯。
+            double frontTime = receiver.LatestTime;
+            if (leftReceiver.TryGetClosestFrame(frontTime, out var leftFrame)
+                && System.Math.Abs(frontTime - leftFrame.time) <= maxTimeDiff
+                && leftFrame.pose != null && leftFrame.pose.Count > 0)
+            {
+                leftPose = leftFrame.pose;
+            }
         }
 
-        // ── 身体 + 头：前摄即可（正面 XY 足够）──
-        if (enableBodyRotation && !disableBodyRotation) ApplyBodyRotation(frontPose);
-        if (enableHeadRotation) ApplyHeadRotation(frontPose);
+        if (enableBodyRotation && !disableBodyRotation)
+            ApplyBodyRotation(frontPose);
 
-        // ── 手臂：置信度融合（前摄为主，左摄辅助 Z）──
-        ApplyLimbConfidenceFusion(_leftUpperArmRig,  _leftLowerArmRig,  frontPose, leftPose, "11", "13", "15", armBaseWeight);
-        ApplyLimbConfidenceFusion(_rightUpperArmRig, _rightLowerArmRig, frontPose, leftPose, "12", "14", "16", armBaseWeight);
+        if (enableHeadRotation)
+            ApplyHeadRotation(frontPose);
 
-        // ── 腿：置信度融合（左摄权重更高，前后运动靠侧面）──
-        ApplyLimbConfidenceFusion(_leftUpperLegRig,  _leftLowerLegRig,  frontPose, leftPose, "23", "25", "27", legBaseWeight);
-        ApplyLimbConfidenceFusion(_rightUpperLegRig, _rightLowerLegRig, frontPose, leftPose, "24", "26", "28", legBaseWeight);
+        ApplyLimbRigDual(_leftUpperArmRig,  _leftLowerArmRig,  frontPose, leftPose, "11", "13", "15", 0.3f);
+        ApplyLimbRigDual(_rightUpperArmRig, _rightLowerArmRig, frontPose, leftPose, "12", "14", "16", 0.3f);
 
-        // ── 脚：置信度融合 ──
-        ApplyFootConfidenceFusion(frontPose, leftPose, true,  legBaseWeight);
-        ApplyFootConfidenceFusion(frontPose, leftPose, false, legBaseWeight);
+        // ── 腿部：测量腿几何（下蹲/投影共用），不写显示骨，关节由 FootPlantingController 接管 ──
+        HandleLeg(_leftUpperLegRig,  _leftLowerLegRig,  frontPose, leftPose, "23", "25", "27", legBlendWeight,
+                  isLeftFoot: true,  ref PlannedLeftAnkle,  ref LeftUpperPlanned,  ref LeftLowerPlanned);
+        HandleLeg(_rightUpperLegRig, _rightLowerLegRig, frontPose, leftPose, "24", "26", "28", legBlendWeight,
+                  isLeftFoot: false, ref PlannedRightAnkle, ref RightUpperPlanned, ref RightLowerPlanned);
+        PlannedLeftAnkle  = _leftUpperLegRig.bone != null ? PlannedLeftAnkle : Vector3.zero;
+        PlannedRightAnkle = _rightUpperLegRig.bone != null ? PlannedRightAnkle : Vector3.zero;
 
-        // ── 手掌 + 手指：纯前摄 ──
+        // ── 下蹲：识别站立基准 → 目标下降量（仅新帧）→ 每帧平滑 → 应用骨盆（仅脚 IK 生效时）──
+        if (footIKActive)
+        {
+            UpdateSquat(frontPose); // 测量：仅有效新帧更新目标下降量
+            if (enableSquat)
+            {
+                SmoothAndApplySquat(Time.deltaTime);
+            }
+            else
+            {
+                SquareFailWhenDisabled();
+                RestoreHipsToBase();
+            }
+            // 应用骨盆后再投影独立踝位（FootPlantingController 读到骨盆修正后的脚位）
+            PlannedLeftAnkle = FKProjectAnkle(_leftUpperLegRig, _leftLowerLegRig,
+                                              LeftUpperPlanned, LeftLowerPlanned, _leftFootRig);
+            PlannedRightAnkle = FKProjectAnkle(_rightUpperLegRig, _rightLowerLegRig,
+                                               RightUpperPlanned, RightLowerPlanned, _rightFootRig);
+            _lastPlannedL = PlannedLeftAnkle;
+            _lastPlannedR = PlannedRightAnkle;
+            _plannedValid = true;
+        }
+        else
+        {
+            // 脚 IK 关闭 → 下蹲控制同步退出，恢复骨盆基准高度
+            RestoreHipsToBase();
+        }
+
+        if (!footIKActive)
+        {
+            // 脚部回正：仅在非 IK 时由本驱动写入；IK 模式下由 FootPlantingController 负责小腿后恢复脚朝向
+            ApplyFootRigDual(frontPose, leftPose, true, legBlendWeight);
+            ApplyFootRigDual(frontPose, leftPose, false, legBlendWeight);
+        }
+
         if (enableFingerRotation)
         {
             ApplyHandAndFingers(frontPose, true);
@@ -365,117 +396,377 @@ public class HumanoidPoseDriver : MonoBehaviour
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // 置信度融合 — 核心改进
-    // ══════════════════════════════════════════════════════════════
-
     /// <summary>
-    /// 置信度驱动的双摄方向融合。
-    ///
-    /// 权重公式：
-    ///   前摄权 = (1 - baseWeight) × frontVisibility
-    ///   左摄权 = baseWeight × leftVisibility
-    ///   归一化 → 可见度低的摄像头自动降权
-    ///
-    /// baseWeight: 0.3=手臂, 0.5=腿部
+    /// 处理单条腿。foreIKActive 时：计算方向的加权结果 → 目标局部旋转 →（若脚 IK 开启）仅投影出“独立踝位”不写骨；
+    /// 否则照旧写入 FK。
     /// </summary>
-    void ApplyLimbConfidenceFusion(BoneRig upperRig, BoneRig lowerRig,
+    void HandleLeg(BoneRig upperRig, BoneRig lowerRig,
         Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
-        string a, string b, string c, float baseLeftWeight)
+        string a, string b, string c, float leftWeight, bool isLeftFoot,
+        ref Vector3 plannedAnkle, ref Quaternion upperPlanned, ref Quaternion lowerPlanned)
     {
-        bool fOk = front != null && front.ContainsKey(a) && front.ContainsKey(b) && front.ContainsKey(c);
-        bool lOk = left  != null && left.ContainsKey(a)  && left.ContainsKey(b)  && left.ContainsKey(c);
+        GetLegDirs(front, left, a, b, c, leftWeight, out Vector3 dirUpper, out Vector3 dirLower);
 
-        if (!fOk && !lOk) return;
+        Quaternion upperTarget = ComputeBoneRigTarget(upperRig, dirUpper);
+        Quaternion lowerTarget = ComputeBoneRigTarget(lowerRig, dirLower);
+        upperPlanned = upperTarget;
+        lowerPlanned = lowerTarget;
 
-        // 获取可见度（取三个关节中最低的，保守估计）
-        float fVis = fOk ? Mathf.Min(front[a].visibility, front[b].visibility, front[c].visibility) : 0f;
-        float lVis = lOk ? Mathf.Min(left[a].visibility,  left[b].visibility,  left[c].visibility)  : 0f;
+        // 测量腿几何（独立于髋位置）：H 伸展量 + 膝角 + 世界骨长/方向（供下蹲 & 平面投影共用）
+        MeasureLeg(upperRig, lowerRig, upperTarget, lowerTarget, isLeftFoot);
 
-        // 低于阈值的不参与
-        if (fVis < minVisibility) fVis = 0f;
-        if (lVis < minVisibility) lVis = 0f;
+        plannedAnkle = Vector3.zero; // 投影推迟到 squat 应用骨盆后由 ProjectPlannedAnkles() 统一计算
 
-        // 动态权重
-        float fw = (1f - baseLeftWeight) * fVis;
-        float lw = baseLeftWeight * lVis;
-        float total = fw + lw;
-        if (total < 0.001f) return;
+        if (!footIKActive)
+        {
+            ApplyBoneRig(upperRig, dirUpper, rotationSmooth);
+            ApplyBoneRig(lowerRig, dirLower, rotationSmooth);
+        }
+    }
 
-        // 归一化
-        fw /= total;
-        lw /= total;
+    /// <summary>测量单腿：世界大腿/小腿方向、骨长、H(垂直伸展量)、膝内角。不使用髋世界位置(保证独立)。</summary>
+    void MeasureLeg(BoneRig upperRig, BoneRig lowerRig,
+        Quaternion upperTarget, Quaternion lowerTarget, bool isLeft)
+    {
+        Transform up = upperRig.bone, low = lowerRig.bone;
+        if (up == null || low == null) return;
+        Quaternion upParentRot = up.parent != null ? up.parent.rotation : Quaternion.identity;
+        Quaternion upWorldRot = upParentRot * upperTarget;
+        Quaternion lowWorldRot = upWorldRot * lowerTarget;
 
-        Vector3 dirUpper = Vector3.zero, dirLower = Vector3.zero;
+        Vector3 thighDir = upWorldRot * upperRig.restAxisLocal;
+        Vector3 shinDir = lowWorldRot * lowerRig.restAxisLocal;
+        float thighLen = low.localPosition.magnitude;
+        float shinLen = (isLeft ? _leftFootRig : _rightFootRig).bone != null
+            ? (isLeft ? _leftFootRig : _rightFootRig).bone.localPosition.magnitude
+            : 0.05f;
 
-        if (fOk && fw > 0.001f)
+        float H = -(thighLen * thighDir + shinLen * shinDir).y;   // 髋→踝垂直伸展(越直越大)
+        float kneeDeg = 180f - Vector3.Angle(thighDir, shinDir);  // 膝内角(站立≈180)
+
+        if (isLeft)
+        {
+            _leftThighDir = thighDir; _leftShinDir = shinDir;
+            _leftThighLen = thighLen; _leftShinLen = shinLen;
+            _leftH = H; _leftKneeDeg = kneeDeg;
+        }
+        else
+        {
+            _rightThighDir = thighDir; _rightShinDir = shinDir;
+            _rightThighLen = thighLen; _rightShinLen = shinLen;
+            _rightH = H; _rightKneeDeg = kneeDeg;
+        }
+    }
+
+    /// <summary>求一条腿的 上/下 世界方向（前摄 + 左摄加权），不写骨。方向分量会被归一化。</summary>
+    void GetLegDirs(Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
+        string a, string b, string c, float leftWeight, out Vector3 dirUpper, out Vector3 dirLower)
+    {
+        dirUpper = Vector3.zero;
+        dirLower = Vector3.zero;
+        bool fOk = front != null && LandmarksPresent(front, a, b, c);
+        bool lOk = left != null && LandmarksUsable(left, a, b, c);
+        float totalW = 0f;
+
+        if (fOk)
         {
             Vector3 p1 = CoordinateConverter.ToUnityWorld(front[a]);
             Vector3 p2 = CoordinateConverter.ToUnityWorld(front[b]);
             Vector3 p3 = CoordinateConverter.ToUnityWorld(front[c]);
-            dirUpper += (p2 - p1).normalized * fw;
-            dirLower += (p3 - p2).normalized * fw;
+            float w = 1f - leftWeight;
+            dirUpper += (p2 - p1).normalized * w;
+            dirLower += (p3 - p2).normalized * w;
+            totalW += w;
+        }
+        if (lOk)
+        {
+            Vector3 p1 = CoordinateConverter.ToUnityWorldLeft(left[a]);
+            Vector3 p2 = CoordinateConverter.ToUnityWorldLeft(left[b]);
+            Vector3 p3 = CoordinateConverter.ToUnityWorldLeft(left[c]);
+            dirUpper += (p2 - p1).normalized * leftWeight;
+            dirLower += (p3 - p2).normalized * leftWeight;
+            totalW += leftWeight;
+        }
+        if (dirUpper.sqrMagnitude > 1e-6f) dirUpper.Normalize();
+        if (dirLower.sqrMagnitude > 1e-6f) dirLower.Normalize();
+    }
+
+    /// <summary>
+    /// 用“计划 FK 局部旋转”正向运动学投影出独立踝位。
+    /// 使用髋(上腿.parent)当前旋转（未被腿 IK 改写）+ 计划旋转 + 骨段长度，不读显示骨当前值。
+    /// </summary>
+    Vector3 FKProjectAnkle(BoneRig upperRig, BoneRig lowerRig,
+        Quaternion upperTarget, Quaternion lowerTarget, BoneRig footRig)
+    {
+        Transform up = upperRig.bone, low = lowerRig.bone;
+        if (up == null || low == null) return Vector3.zero;
+
+        Quaternion upParentRot = up.parent != null ? up.parent.rotation : Quaternion.identity;
+        Quaternion upWorldRot = upParentRot * upperTarget;
+        Vector3 hipPos = up.position;                              // 髋关节（由根+身体旋转决定，非腿IK）
+        Vector3 kneeWorld = hipPos + upWorldRot * low.localPosition;   // 膝偏移在 upper 自身局部空间
+        Quaternion lowWorldRot = upWorldRot * lowerTarget;
+        Vector3 ankleLocal = footRig != null && footRig.bone != null
+            ? footRig.bone.localPosition
+            : low.localPosition;
+        Vector3 ankleWorld = kneeWorld + lowWorldRot * ankleLocal;
+        return ankleWorld;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // 下蹲：（仅脚 IK 生效时）站立基准识别 + 下降量估计 + 骨盆垂直偏移
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>识别站立基准 + 计算目标下降量（仅有效新帧更新；渲染帧只平滑）。</summary>
+    /// <summary>测量（仅有效新帧更新目标下降量；渲染帧不重置）。</summary>
+    void UpdateSquat(Dictionary<string, Landmark> pose)
+    {
+        bool validData = false;
+        double frameDt = 0;
+        var recv = receiver;
+        if (recv != null)
+        {
+            if (recv.LatestFrameId != _squatLastFrameId)
+            {
+                double now = recv.LatestTime;
+                if (_squatPrevTime >= 0 && now > _squatPrevTime && now - _squatPrevTime > 1e-4)
+                {
+                    validData = true;
+                    frameDt = now - _squatPrevTime;
+                }
+                else
+                {
+                    _standTime = 0d; // 时间戳倒退/重置 → 清空候选计时
+                }
+                _squatPrevTime = now;
+                _squatLastFrameId = recv.LatestFrameId;
+            }
         }
 
-        if (lOk && lw > 0.001f)
+        // 分腿置信度（左右腿独立）
+        float lc = 1f, rc = 1f;
+        foreach (var k in new[] { "23", "25", "27" }) { if (pose.TryGetValue(k, out var lm)) lc = Mathf.Min(lc, lm.visibility); else { lc = 0f; break; } }
+        foreach (var k in new[] { "24", "26", "28" }) { if (pose.TryGetValue(k, out var lm)) rc = Mathf.Min(rc, lm.visibility); else { rc = 0f; break; } }
+        _leftConf = lc; _rightConf = rc;
+        LeftLegConfidence = lc; RightLegConfidence = rc;
+        LeftKneeAngleDeg = _leftKneeDeg; RightKneeAngleDeg = _rightKneeDeg;
+
+        // 接地：必须已有有效计划脚位（不采用初始零计划位）
+        bool nearGround = _plannedValid &&
+            (_lastPlannedL.y - boardY) <= 0.30f && (_lastPlannedR.y - boardY) <= 0.30f;
+
+        bool kneeOk = _leftKneeDeg >= squatKneeAngleMin && _rightKneeDeg >= squatKneeAngleMin;
+        bool visOk = lc >= squatMinVisibility && rc >= squatMinVisibility;
+        bool standing = kneeOk && visOk && nearGround;
+
+        SquatFailReason = "";
+        if (!kneeOk) SquatFailReason = "膝角不足(需≥" + squatKneeAngleMin.ToString("F0") + "°)";
+        else if (!visOk) SquatFailReason = "可见度不足(需≥" + squatMinVisibility.ToString("F2") + ")";
+        else if (!nearGround) SquatFailReason = "双脚未稳定接地";
+
+        SquatDataValid = validData && (lc >= 0.30f || rc >= 0.30f);
+        if (validData) _standTime = standing ? _standTime + frameDt : 0d;
+
+        if (!_squatBaselineEstablished && _standTime >= squatRecognizeTime && standing)
         {
-            Vector3 p1 = CoordinateConverter.ToUnityWorld(left[a]);
-            Vector3 p2 = CoordinateConverter.ToUnityWorld(left[b]);
-            Vector3 p3 = CoordinateConverter.ToUnityWorld(left[c]);
-            dirUpper += (p2 - p1).normalized * lw;
-            dirLower += (p3 - p2).normalized * lw;
+            _H0 = (_leftH + _rightH) * 0.5f;
+            _squatBaselineEstablished = true;
+            _smoothDescent = 0f;
+            _squatTargetDescent = 0f;
+            _squatInvalidTime = 0f; _recoverTimer = 0f; _wasInvalid = false;
+            Debug.Log("[Squat] 站立基准已建立.");
+        }
+        BaselineEstablished = _squatBaselineEstablished;
+
+        if (_squatBaselineEstablished && SquatDataValid)
+        {
+            // 平均腿长 = (左大腿+左小腿+右大腿+右小腿) / 2
+            float avgLegLen = (_leftThighLen + _leftShinLen + _rightThighLen + _rightShinLen) * 0.5f;
+            float maxDescent = Mathf.Max(0.01f, avgLegLen * squatMaxDescentRatio);
+            bool dual = lc >= 0.30f && rc >= 0.30f;
+            float target;
+            SquatLimitReason = "";
+            if (dual)
+            {
+                float dL = _H0 - _leftH;
+                float dR = _H0 - _rightH;
+                float wL = Mathf.Clamp01(lc), wR = Mathf.Clamp01(rc);
+                target = (dL * wL + dR * wR) / Mathf.Max(1e-4f, wL + wR);
+            }
+            else
+            {
+                // 单脚迈步/抬腿：保持已有下降量，不把抬膝当蹲
+                target = _smoothDescent;
+                SquatLimitReason = "单脚支撑，保持高度";
+            }
+            target = Mathf.Clamp(target, 0f, maxDescent);
+            if (target < squatDeadzone) target = 0f;
+            _squatTargetDescent = target;
+        }
+        else if (!_squatBaselineEstablished)
+        {
+            _squatTargetDescent = 0f;
+        }
+        // 否则：保持上一个 _squatTargetDescent（重复帧不重置为 0）
+
+        // 无效时长/暂停/恢复
+        if (validData) _squatInvalidTime = 0f;
+        else _squatInvalidTime += Time.deltaTime;
+        SquatPaused = _squatBaselineEstablished && _squatInvalidTime > 0.25f;
+        if (SquatPaused) _wasInvalid = true;
+        else if (_wasInvalid) { _recoverTimer = 0.2f; _wasInvalid = false; }
+        if (_recoverTimer > 0f) _recoverTimer = Mathf.Max(0f, _recoverTimer - Time.deltaTime);
+    }
+
+    /// <summary>每渲染帧：向缓存目标平滑，随后应用骨盆位置。</summary>
+    void SmoothAndApplySquat(float dt)
+    {
+        if (_squatBaselineEstablished)
+        {
+            if (!SquatPaused)
+            {
+                float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.01f, squatSmoothTimeConst));
+                float smoothed = Mathf.Lerp(_smoothDescent, _squatTargetDescent, a);
+                float maxStep = squatMaxSpeed * dt;
+                _smoothDescent = Mathf.MoveTowards(_smoothDescent, smoothed, maxStep);
+            }
+            // 恢复(200ms)由时间常数平滑自然完成；暂停时保持最后安全高度
+        }
+        else
+        {
+            _smoothDescent = 0f;
+        }
+        DescentMeters = Mathf.Max(0f, _smoothDescent);
+        ApplyPelvisOffset();
+    }
+
+    /// <summary>将骨盘 Hips 沿世界竖直方向下移（单写入者；从基准局部位置计算，不逐帧累加；修正父缩放）。</summary>
+    void ApplyPelvisOffset()
+    {
+        if (!_hipsBaseCaptured || _hips == null || _hipsParent == null) return;
+        if (_squatBaselineEstablished)
+        {
+            // 目标世界位置 = 基准世界位置 + 世界向下 × DescentMeters → 转回父局部（正确处理父缩放/旋转/平移）
+            Vector3 baseWorld = _hipsParent.TransformPoint(_hipsBaseLocalPos);
+            Vector3 targetWorld = baseWorld + Vector3.down * DescentMeters;
+            _hips.localPosition = _hipsParent.InverseTransformPoint(targetWorld);
+        }
+        else
+        {
+            RestoreHipsToBase();
+        }
+    }
+
+    void SquareFailWhenDisabled()
+    {
+        SquatTargetDescent = 0f;
+        DescentMeters = 0f;
+        SquatPaused = false;
+        SquatLimitReason = "下蹲已关闭";
+    }
+
+    void RestoreHipsToBase()
+    {
+        if (!_hipsBaseCaptured || _hips == null) return;
+        _hips.localPosition = _hipsBaseLocalPos;
+    }
+    public void ReidentifyStandingBaseline()
+    {
+        _squatBaselineEstablished = false;
+        _standTime = 0d;
+        _smoothDescent = 0f;
+        _squatTargetDescent = 0f;
+        _squatLastFrameId = -1;
+        _squatPrevTime = -1;
+        RestoreHipsToBase();
+        Debug.Log("[Squat] 重新识别站立基准已触发—请站直。");
+    }
+
+    /// <summary>返回目标局部旋转（不写骨）；等价 ApplyBoneRig 中的 targetLocalRot。</summary>
+    Quaternion ComputeBoneRigTarget(BoneRig rig, Vector3 targetDirWorld)
+    {
+        if (rig?.bone == null || targetDirWorld.sqrMagnitude < 1e-6f)
+            return rig != null ? rig.restLocalRotation : Quaternion.identity;
+
+        Vector3 desiredParentDir = rig.bone.parent != null
+            ? rig.bone.parent.InverseTransformDirection(targetDirWorld.normalized)
+            : targetDirWorld.normalized;
+        if (desiredParentDir.sqrMagnitude < 1e-6f) return rig.restLocalRotation;
+
+        Vector3 restParentDir = rig.restLocalRotation * rig.restAxisLocal;
+        if (restParentDir.sqrMagnitude < 1e-6f) return rig.restLocalRotation;
+
+        Quaternion delta = Quaternion.FromToRotation(restParentDir.normalized, desiredParentDir.normalized);
+        return delta * rig.restLocalRotation;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // 双摄混合
+    // ══════════════════════════════════════════════════════════════
+
+    void ApplyLimbRigDual(BoneRig upperRig, BoneRig lowerRig,
+        Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
+        string a, string b, string c, float leftWeight)
+    {
+        // 前摄是已验证的 v4 基准姿态源：与 v4 一样，只要求关键点存在。
+        // visibility 门槛只用于左摄贡献；否则前摄任一点短暂低于阈值时，
+        // 整条肢体会冻结在上一姿势，看起来像映射修改完全没有生效。
+        bool fOk = front != null && LandmarksPresent(front, a, b, c);
+        bool lOk = left  != null && LandmarksUsable(left,  a, b, c);
+        if (!fOk && !lOk) return;
+
+        Vector3 dirUpper = Vector3.zero, dirLower = Vector3.zero;
+        float totalW = 0f;
+
+        if (fOk)
+        {
+            Vector3 p1 = CoordinateConverter.ToUnityWorld(front[a]);
+            Vector3 p2 = CoordinateConverter.ToUnityWorld(front[b]);
+            Vector3 p3 = CoordinateConverter.ToUnityWorld(front[c]);
+            float w = 1f - leftWeight;
+            dirUpper += (p2 - p1).normalized * w;
+            dirLower += (p3 - p2).normalized * w;
+            totalW += w;
+        }
+        if (lOk)
+        {
+            // ⚠️ 左摄坐标系矫正: X↔Z 交换
+            //    左摄画面X=房间前后 → 应映射到Unity Z
+            Vector3 p1 = CoordinateConverter.ToUnityWorldLeft(left[a]);
+            Vector3 p2 = CoordinateConverter.ToUnityWorldLeft(left[b]);
+            Vector3 p3 = CoordinateConverter.ToUnityWorldLeft(left[c]);
+            dirUpper += (p2 - p1).normalized * leftWeight;
+            dirLower += (p3 - p2).normalized * leftWeight;
+            totalW += leftWeight;
         }
 
         if (dirUpper.sqrMagnitude > 1e-6f) dirUpper.Normalize();
         if (dirLower.sqrMagnitude > 1e-6f) dirLower.Normalize();
-
         ApplyBoneRig(upperRig, dirUpper, rotationSmooth);
         ApplyBoneRig(lowerRig, dirLower, rotationSmooth);
     }
 
-    void ApplyFootConfidenceFusion(Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
-        bool isLeftFoot, float baseLeftWeight)
+    void ApplyFootRigDual(Dictionary<string, Landmark> front, Dictionary<string, Landmark> left,
+        bool isLeftFoot, float leftWeight)
     {
         BoneRig rig = isLeftFoot ? _leftFootRig : _rightFootRig;
         if (rig.bone == null) return;
-
         string ankle = isLeftFoot ? "27" : "28";
         string toe   = isLeftFoot ? "31" : "32";
 
-        bool fOk = front != null && front.ContainsKey(ankle) && front.ContainsKey(toe);
-        bool lOk = left  != null && left.ContainsKey(ankle)  && left.ContainsKey(toe);
+        bool fOk = front != null && LandmarksPresent(front, ankle, toe);
+        bool lOk = left  != null && LandmarksUsable(left,  ankle, toe);
         if (!fOk && !lOk) return;
 
-        float fVis = fOk ? Mathf.Min(front[ankle].visibility, front[toe].visibility) : 0f;
-        float lVis = lOk ? Mathf.Min(left[ankle].visibility,  left[toe].visibility)  : 0f;
-        if (fVis < minVisibility) fVis = 0f;
-        if (lVis < minVisibility) lVis = 0f;
-
-        float fw = (1f - baseLeftWeight) * fVis;
-        float lw = baseLeftWeight * lVis;
-        float total = fw + lw;
-        if (total < 0.001f) return;
-        fw /= total; lw /= total;
-
         Vector3 dir = Vector3.zero;
-        if (fOk && fw > 0.001f)
-        {
-            Vector3 a = CoordinateConverter.ToUnityWorld(front[ankle]);
-            Vector3 t = CoordinateConverter.ToUnityWorld(front[toe]);
-            dir += (t - a).normalized * fw;
-        }
-        if (lOk && lw > 0.001f)
-        {
-            Vector3 a = CoordinateConverter.ToUnityWorld(left[ankle]);
-            Vector3 t = CoordinateConverter.ToUnityWorld(left[toe]);
-            dir += (t - a).normalized * lw;
-        }
+        if (fOk) { Vector3 a = CoordinateConverter.ToUnityWorld(front[ankle]); Vector3 t = CoordinateConverter.ToUnityWorld(front[toe]); dir += (t - a).normalized * (1f - leftWeight); }
+        if (lOk) { Vector3 a = CoordinateConverter.ToUnityWorldLeft(left[ankle]);  Vector3 t = CoordinateConverter.ToUnityWorldLeft(left[toe]);  dir += (t - a).normalized * leftWeight; }
         if (dir.sqrMagnitude > 1e-6f) dir.Normalize();
         ApplyBoneRig(rig, dir, rotationSmooth);
     }
 
     // ══════════════════════════════════════════════════════════════
-    // 身体 / 头 / 手指 — 纯前摄（不变）
+    // 身体 / 头 / 手指
     // ══════════════════════════════════════════════════════════════
 
     void ApplyBodyRotation(Dictionary<string, Landmark> pose)
@@ -488,84 +779,98 @@ public class HumanoidPoseDriver : MonoBehaviour
         Vector3 lh = CoordinateConverter.ToUnityWorld(pose["23"]);
         Vector3 rh = CoordinateConverter.ToUnityWorld(pose["24"]);
 
+        Vector3 shoulderCenter = (ls + rs) * 0.5f;
+        Vector3 hipCenter = (lh + rh) * 0.5f;
+
+        Vector3 up = shoulderCenter - hipCenter;
+        if (up.sqrMagnitude < 1e-6f) return;
+        up.Normalize();
+
         Vector3 shoulderRight = rs - ls;
         if (shoulderRight.sqrMagnitude < 1e-6f) return;
         shoulderRight.Normalize();
 
-        Vector3 rawForward = Vector3.Cross(shoulderRight, Vector3.up).normalized;
-        if (invertBodyForward) rawForward = -rawForward;
+        Vector3 forward = Vector3.Cross(shoulderRight, up).normalized;
+        if (invertBodyForward) forward = -forward;
 
-        // 平滑朝向（减少 MediaPipe 噪声导致的旋转抖动）
-        if (!_bodyForwardInitialized)
-        {
-            // ⭐ 第一帧直接初始化为当前方向，避免从 Vector3.forward(0,0,1) 慢慢 Slerp 过去
-            _smoothBodyForward = rawForward;
-            _bodyForwardInitialized = true;
-        }
-        else
-        {
-            _smoothBodyForward = Vector3.Slerp(_smoothBodyForward, rawForward,
-                Time.deltaTime * bodyRotationSmooth * 0.3f);  // 较慢的平滑，抵消噪声
-        }
-
-        _hips.rotation = Quaternion.Slerp(_hips.rotation,
-            Quaternion.LookRotation(_smoothBodyForward, Vector3.up),
-            Time.deltaTime * bodyRotationSmooth);
+        Quaternion targetHipsWorldRot = Quaternion.LookRotation(forward, up);
+        _hips.rotation = Quaternion.Slerp(_hips.rotation, targetHipsWorldRot, Time.deltaTime * bodyRotationSmooth);
 
         Vector3 hipRight = rh - lh;
         if (hipRight.sqrMagnitude < 1e-6f) return;
         hipRight.Normalize();
 
-        Vector3 hipRightFlat = Vector3.ProjectOnPlane(hipRight, Vector3.up);
-        Vector3 shoulderRightFlat = Vector3.ProjectOnPlane(shoulderRight, Vector3.up);
+        Vector3 hipRightFlat = Vector3.ProjectOnPlane(hipRight, up);
+        Vector3 shoulderRightFlat = Vector3.ProjectOnPlane(shoulderRight, up);
         if (hipRightFlat.sqrMagnitude < 1e-6f || shoulderRightFlat.sqrMagnitude < 1e-6f) return;
         hipRightFlat.Normalize(); shoulderRightFlat.Normalize();
 
-        float twist = Mathf.Clamp(Vector3.SignedAngle(hipRightFlat, shoulderRightFlat, Vector3.up), -70f, 70f);
-        DriveSpineBone(_spine, _spineRestLocalRot, twist * 0.40f);
-        DriveSpineBone(_chest, _chestRestLocalRot, twist * 0.35f);
-        DriveSpineBone(_upperChest, _upperChestRestLocalRot, twist * 0.25f);
+        float twistAngle = Mathf.Clamp(Vector3.SignedAngle(hipRightFlat, shoulderRightFlat, up), -70f, 70f);
+        DriveSpineBone(_spine, _spineRestLocalRot, twistAngle * 0.40f);
+        DriveSpineBone(_chest, _chestRestLocalRot, twistAngle * 0.35f);
+        DriveSpineBone(_upperChest, _upperChestRestLocalRot, twistAngle * 0.25f);
     }
 
-    void DriveSpineBone(Transform b, Quaternion rest, float deg)
+    void DriveSpineBone(Transform bone, Quaternion restLocalRot, float twistDeg)
     {
-        if (b == null) return;
-        Quaternion tgt = rest * Quaternion.AngleAxis(deg, Vector3.up);
-        b.localRotation = Quaternion.Slerp(b.localRotation, tgt, Time.deltaTime * bodyRotationSmooth);
+        if (bone == null) return;
+        Quaternion targetLocal = restLocalRot * Quaternion.AngleAxis(twistDeg, Vector3.up);
+        bone.localRotation = Quaternion.Slerp(bone.localRotation, targetLocal, Time.deltaTime * bodyRotationSmooth);
     }
 
     void ApplyHeadRotation(Dictionary<string, Landmark> pose)
     {
         if (_head == null || !pose.ContainsKey("0")) return;
-
         Vector3 nose = CoordinateConverter.ToUnityWorld(pose["0"]);
-        Vector3 fwd, up;
 
         if (pose.ContainsKey("7") && pose.ContainsKey("8"))
         {
-            Vector3 le = CoordinateConverter.ToUnityWorld(pose["7"]);
-            Vector3 re = CoordinateConverter.ToUnityWorld(pose["8"]);
-            fwd = nose - (le + re) * 0.5f;
-            if (fwd.sqrMagnitude < 1e-6f) return;
-            fwd.Normalize();
-            up = Vector3.Cross(fwd, (re - le).normalized);
-            if (up.sqrMagnitude < 1e-6f) up = Vector3.up;
-            up.Normalize();
-        }
-        else
-        {
-            if (!pose.ContainsKey("11") || !pose.ContainsKey("12")) return;
-            Vector3 sc = (CoordinateConverter.ToUnityWorld(pose["11"]) + CoordinateConverter.ToUnityWorld(pose["12"])) * 0.5f;
-            fwd = nose - sc;
-            if (fwd.sqrMagnitude < 1e-6f) return;
-            fwd.Normalize();
-            up = Vector3.up;
-        }
+            Vector3 ear1 = CoordinateConverter.ToUnityWorld(pose["7"]);
+            Vector3 ear2 = CoordinateConverter.ToUnityWorld(pose["8"]);
+            Vector3 earCenter = (ear1 + ear2) * 0.5f;
 
-        Quaternion targetWorld = SafeLookRotation(fwd, up);
-        Quaternion targetLocal = _head.parent != null
-            ? Quaternion.Inverse(_head.parent.rotation) * targetWorld : targetWorld;
-        _head.localRotation = Quaternion.Slerp(_head.localRotation, targetLocal, Time.deltaTime * headRotationSmooth);
+            // 头部前向：鼻子 → 远离耳朵中心
+            Vector3 fwdWorld = nose - earCenter;
+            if (fwdWorld.sqrMagnitude < 1e-6f) return;
+            fwdWorld.Normalize();
+
+            // 耳线方向：pose[7]↔pose[8] 经 FRONT_POSE_SIDE_SWAP 后左右
+            // 含义反转（7=右耳, 8=左耳）。以下用世界 up 自动判断正确符号：
+            Vector3 earDir = ear2 - ear1;                    // 可能是左或右
+            Vector3 approxRight = Vector3.Cross(Vector3.up, fwdWorld);
+            // 若 earDir 和 approxRight 反向 → 翻转 earDir
+            if (Vector3.Dot(earDir, approxRight) < 0f)
+                earDir = -earDir;
+
+            Vector3 upWorld = Vector3.Cross(fwdWorld, earDir.normalized);
+            if (upWorld.sqrMagnitude < 1e-6f) upWorld = Vector3.up; else upWorld.Normalize();
+
+            Quaternion targetWorld = SafeLookRotation(fwdWorld, upWorld);
+            Quaternion targetLocal = _head.parent != null
+                ? Quaternion.Inverse(_head.parent.rotation) * targetWorld
+                : targetWorld;
+
+            _head.localRotation = Quaternion.Slerp(
+                _head.localRotation, targetLocal,
+                Time.deltaTime * headRotationSmooth);
+        }
+        else if (pose.ContainsKey("11") && pose.ContainsKey("12"))
+        {
+            Vector3 sc = (CoordinateConverter.ToUnityWorld(pose["11"]) +
+                          CoordinateConverter.ToUnityWorld(pose["12"])) * 0.5f;
+            Vector3 fwdWorld = nose - sc;
+            if (fwdWorld.sqrMagnitude < 1e-6f) return;
+            fwdWorld.Normalize();
+
+            Quaternion targetWorld = SafeLookRotation(fwdWorld, Vector3.up);
+            Quaternion targetLocal = _head.parent != null
+                ? Quaternion.Inverse(_head.parent.rotation) * targetWorld
+                : targetWorld;
+
+            _head.localRotation = Quaternion.Slerp(
+                _head.localRotation, targetLocal,
+                Time.deltaTime * headRotationSmooth);
+        }
     }
 
     void ApplyHandAndFingers(Dictionary<string, Landmark> pose, bool isLeft)
@@ -574,18 +879,17 @@ public class HumanoidPoseDriver : MonoBehaviour
         BasisRig handRig = isLeft ? _leftHandRig : _rightHandRig;
         if (handRig.bone == null) return;
 
-        if (TryGetHandPt(pose, prefix, 0, out Vector3 wrist) &&
-            TryGetHandPt(pose, prefix, 5, out Vector3 iMcp) &&
-            TryGetHandPt(pose, prefix, 9, out Vector3 mMcp) &&
-            TryGetHandPt(pose, prefix, 17, out Vector3 pMcp))
+        if (TryGetHandPoint(pose, prefix, 0, out Vector3 wrist) &&
+            TryGetHandPoint(pose, prefix, 5, out Vector3 iMcp) &&
+            TryGetHandPoint(pose, prefix, 9, out Vector3 mMcp) &&
+            TryGetHandPoint(pose, prefix, 17, out Vector3 pMcp))
         {
             Vector3 fwd = mMcp - wrist;
             if (fwd.sqrMagnitude > 1e-6f)
             {
                 fwd.Normalize();
                 Vector3 up = Vector3.Cross(iMcp - wrist, pMcp - wrist);
-                if (up.sqrMagnitude < 1e-6f) up = Vector3.up;
-                up.Normalize();
+                if (up.sqrMagnitude < 1e-6f) up = Vector3.up; else up.Normalize();
                 ApplyBasisRig(handRig, fwd, up, fingerRotationSmooth);
             }
         }
@@ -597,12 +901,11 @@ public class HumanoidPoseDriver : MonoBehaviour
     {
         for (int f = 0; f < 5; f++)
         {
-            var c = chains[f];
-            if (c == null) continue;
-            if (!TryGetHandPt(pose, prefix, FingerIdx(f, 1), out Vector3 p1)) continue;
-            if (!TryGetHandPt(pose, prefix, FingerIdx(f, 2), out Vector3 p2)) continue;
-            if (!TryGetHandPt(pose, prefix, FingerIdx(f, 3), out Vector3 p3)) continue;
-            TryGetHandPt(pose, prefix, FingerIdx(f, 4), out Vector3 p4);
+            var c = chains[f]; if (c == null) continue;
+            if (!TryGetHandPoint(pose, prefix, FingerIdx(f, 1), out Vector3 p1)) continue;
+            if (!TryGetHandPoint(pose, prefix, FingerIdx(f, 2), out Vector3 p2)) continue;
+            if (!TryGetHandPoint(pose, prefix, FingerIdx(f, 3), out Vector3 p3)) continue;
+            TryGetHandPoint(pose, prefix, FingerIdx(f, 4), out Vector3 p4);
             ApplyBoneRig(c.proximal, p2 - p1, fingerRotationSmooth);
             ApplyBoneRig(c.intermediate, p3 - p2, fingerRotationSmooth);
             ApplyBoneRig(c.distal, p4.sqrMagnitude > 0f ? p4 - p3 : p3 - p2, fingerRotationSmooth);
@@ -611,7 +914,30 @@ public class HumanoidPoseDriver : MonoBehaviour
 
     int FingerIdx(int f, int j) { return f * 4 + j; }
 
-    bool TryGetHandPt(Dictionary<string, Landmark> pose, string prefix, int idx, out Vector3 w)
+    /// <summary>
+    /// 该路姿态的关键点是否可用于双摄混合：都存在且可见度达标。
+    /// 遮挡/低置信度时剔除该摄贡献，避免旧姿态混入。
+    /// </summary>
+    bool LandmarksUsable(Dictionary<string, Landmark> pose, params string[] keys)
+    {
+        foreach (var k in keys)
+        {
+            if (!pose.TryGetValue(k, out var lm)) return false;
+            if (lm.visibility < minLandmarkVisibility) return false;
+        }
+        return true;
+    }
+
+    bool LandmarksPresent(Dictionary<string, Landmark> pose, params string[] keys)
+    {
+        foreach (var k in keys)
+        {
+            if (!pose.ContainsKey(k)) return false;
+        }
+        return true;
+    }
+
+    bool TryGetHandPoint(Dictionary<string, Landmark> pose, string prefix, int idx, out Vector3 w)
     {
         string key = prefix + idx.ToString();
         if (pose != null && pose.ContainsKey(key)) { w = CoordinateConverter.ToUnityWorld(pose[key]); return true; }
@@ -635,49 +961,53 @@ public class HumanoidPoseDriver : MonoBehaviour
         if (restParentDir.sqrMagnitude < 1e-6f) return;
 
         Quaternion delta = Quaternion.FromToRotation(restParentDir.normalized, desiredParentDir.normalized);
-        Quaternion targetLocal = delta * rig.restLocalRotation;
+        Quaternion targetLocalRot = delta * rig.restLocalRotation;
 
-        rig.bone.localRotation = Quaternion.Slerp(rig.bone.localRotation, targetLocal, Time.deltaTime * smooth);
-
-        if (enableBoneLimits && (rig.minAngle > -180f || rig.maxAngle < 180f))
-            rig.bone.localRotation = ClampLocalRotation(rig.bone.localRotation, rig.restLocalRotation, rig.minAngle, rig.maxAngle);
+        rig.bone.localRotation = Quaternion.Slerp(rig.bone.localRotation, targetLocalRot, Time.deltaTime * smooth);
     }
 
-    Quaternion ClampLocalRotation(Quaternion cur, Quaternion rest, float minDeg, float maxDeg)
-    {
-        Quaternion rel = Quaternion.Inverse(rest) * cur;
-        Vector3 euler = rel.eulerAngles;
-        float a = euler.x; if (a > 180f) a -= 360f;
-        a = Mathf.Clamp(a, minDeg, maxDeg);
-        return rest * Quaternion.Euler(a, euler.y, euler.z);
-    }
-
-    void ApplyBasisRig(BasisRig rig, Vector3 fwdWorld, Vector3 upWorld, float smooth)
+    void ApplyBasisRig(BasisRig rig, Vector3 targetForwardWorld, Vector3 targetUpWorld, float smooth)
     {
         if (rig?.bone == null) return;
-        if (fwdWorld.sqrMagnitude < 1e-6f || upWorld.sqrMagnitude < 1e-6f) return;
+        if (targetForwardWorld.sqrMagnitude < 1e-6f || targetUpWorld.sqrMagnitude < 1e-6f) return;
 
-        Vector3 pf = rig.bone.parent != null ? rig.bone.parent.InverseTransformDirection(fwdWorld.normalized) : fwdWorld.normalized;
-        Vector3 pu = rig.bone.parent != null ? rig.bone.parent.InverseTransformDirection(upWorld.normalized) : upWorld.normalized;
+        Vector3 desiredParentForward = rig.bone.parent != null ? rig.bone.parent.InverseTransformDirection(targetForwardWorld.normalized) : targetForwardWorld.normalized;
+        Vector3 desiredParentUp = rig.bone.parent != null ? rig.bone.parent.InverseTransformDirection(targetUpWorld.normalized) : targetUpWorld.normalized;
 
-        Vector3 rf = rig.restLocalRotation * rig.restForwardLocal;
-        Vector3 ru = rig.restLocalRotation * rig.restUpLocal;
+        Vector3 restParentForward = rig.restLocalRotation * rig.restForwardLocal;
+        Vector3 restParentUp = rig.restLocalRotation * rig.restUpLocal;
 
-        Quaternion rBasis = SafeLookRotation(rf, ru);
-        Quaternion tBasis = SafeLookRotation(pf, pu);
-        Quaternion delta = tBasis * Quaternion.Inverse(rBasis);
-        Quaternion targetLocal = delta * rig.restLocalRotation;
+        Quaternion restBasis = SafeLookRotation(restParentForward, restParentUp);
+        Quaternion targetBasis = SafeLookRotation(desiredParentForward, desiredParentUp);
+        Quaternion delta = targetBasis * Quaternion.Inverse(restBasis);
+        Quaternion targetLocalRot = delta * rig.restLocalRotation;
 
-        rig.bone.localRotation = Quaternion.Slerp(rig.bone.localRotation, targetLocal, Time.deltaTime * smooth);
+        rig.bone.localRotation = Quaternion.Slerp(rig.bone.localRotation, targetLocalRot, Time.deltaTime * smooth);
     }
 
-    Quaternion SafeLookRotation(Vector3 fwd, Vector3 up)
+    Quaternion SafeLookRotation(Vector3 forward, Vector3 upHint)
     {
-        if (fwd.sqrMagnitude < 1e-6f) return Quaternion.identity;
-        fwd.Normalize();
-        up = Vector3.ProjectOnPlane(up, fwd);
-        if (up.sqrMagnitude < 1e-6f) up = Vector3.ProjectOnPlane(Vector3.up, fwd);
-        if (up.sqrMagnitude < 1e-6f) return Quaternion.identity;
-        return Quaternion.LookRotation(fwd, up.normalized);
+        if (forward.sqrMagnitude < 1e-6f) return Quaternion.identity;
+        forward.Normalize();
+        upHint = Vector3.ProjectOnPlane(upHint, forward);
+        if (upHint.sqrMagnitude < 1e-6f) upHint = Vector3.ProjectOnPlane(Vector3.up, forward);
+        if (upHint.sqrMagnitude < 1e-6f) return Quaternion.identity;
+        return Quaternion.LookRotation(forward, upHint.normalized);
+    }
+
+    void OnGUI()
+    {
+        if (!showSquatOverlay || !footIKActive) return;
+        float x = 10, y = 90, w = 440, lh = 15;
+        GUI.Box(new Rect(x, y, w, lh * 6 + 8), "");
+        y += 4;
+        void L(string s) { GUI.Label(new Rect(x + 6, y, w - 12, lh), s); y += lh; }
+        string age = receiver != null && receiver.HasReceivedAny
+            ? receiver.LatestPacketAgeMs.ToString("F0") + " ms" : "--";
+        L($"[Squat] 基准={(_squatBaselineEstablished ? "已建立" : "未建立(等待站直0.6s)")}  数据帧龄={age}  (非端到端延迟)");
+        L($"  目标下降={_squatTargetDescent:F3}  实际下降={DescentMeters:F3} m");
+        L($"  左膝={_leftKneeDeg:F0}°  右膝={_rightKneeDeg:F0}°  (站立∈[165,180])");
+        L($"  可见度≥{squatMinVisibility:F2}={SquatDataValid}  (蹲姿时腿部可见度需保留)");
+        L($"  [勾选 enableSquat 生效；Mocap→Re-identify Standing Baseline 可重测基准]");
     }
 }

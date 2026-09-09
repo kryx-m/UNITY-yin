@@ -42,3 +42,8 @@ __pycache__/
 
 # Environment
 *.log
+
+# Codex repository safety workflow
+CodexBackups/
+.codex/repo-safety.local.json
+.codex/repo-safety-state/

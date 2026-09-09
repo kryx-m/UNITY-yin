@@ -1,0 +1,7 @@
+{
+  "unityRepo": "<absolute-path-to-unity-project>",
+  "pythonRepo": "<absolute-path-to-python-project>",
+  "worktreeRoot": "<absolute-path-to-codex-worktrees>",
+  "unityExe": "<absolute-path-to-Unity.exe>",
+  "pythonExe": "<absolute-path-to-python.exe>"
+}

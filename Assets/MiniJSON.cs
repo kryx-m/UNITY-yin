@@ -1,4 +1,4 @@
-// MiniJSON£¨¾«¼ò°æ£¬Ö§³ÖDictionary£©
+// MiniJSONï¿½ï¿½ï¿½ï¿½ï¿½ï¿½æ£¬Ö§ï¿½ï¿½Dictionaryï¿½ï¿½
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
@@ -51,6 +51,9 @@ public static class MiniJSON
                 if (c == '{') return ParseObject();
                 if (c == '[') return ParseArray();
                 if (c == '"') return ParseString();
+                if (c == 't') { index += 4; return true; }
+                if (c == 'f') { index += 5; return false; }
+                if (c == 'n') { index += 4; return null; }
 
                 return ParseNumber();
             }
@@ -104,9 +107,35 @@ public static class MiniJSON
 
                 while (true)
                 {
+                    if (index >= json.Length) throw new Exception("Unterminated string");
                     char c = json[index++];
                     if (c == '"') break;
-                    sb.Append(c);
+                    if (c == '\\')
+                    {
+                        if (index >= json.Length) throw new Exception("Unterminated escape");
+                        char e = json[index++];
+                        switch (e)
+                        {
+                            case '"': sb.Append('"'); break;
+                            case '\\': sb.Append('\\'); break;
+                            case '/': sb.Append('/'); break;
+                            case 'b': sb.Append('\b'); break;
+                            case 'f': sb.Append('\f'); break;
+                            case 'n': sb.Append('\n'); break;
+                            case 'r': sb.Append('\r'); break;
+                            case 't': sb.Append('\t'); break;
+                            case 'u':
+                                if (index + 4 > json.Length) throw new Exception("Bad \\u escape");
+                                sb.Append((char)Convert.ToInt32(json.Substring(index, 4), 16));
+                                index += 4;
+                                break;
+                            default: throw new Exception("Bad escape: \\" + e);
+                        }
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
                 }
                 return sb.ToString();
             }
@@ -122,7 +151,7 @@ public static class MiniJSON
                 }
 
                 string num = json.Substring(start, index - start);
-                return double.Parse(num);
+                return double.Parse(num, System.Globalization.CultureInfo.InvariantCulture);
             }
 
             void SkipWhitespace()

@@ -1,0 +1,36 @@
+name: Repository integrity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "codex/**"
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Check repository structure and safety rules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "Assets")) { throw "Assets directory is missing." }
+          if (-not (Test-Path "Packages/manifest.json")) { throw "Packages/manifest.json is missing." }
+          if (-not (Test-Path "ProjectSettings/ProjectVersion.txt")) { throw "Unity ProjectVersion.txt is missing." }
+          . ./Tools/RepoSafety/Common.ps1
+          Assert-SafeRepositoryFiles (Get-Location).Path
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed." }
+
+      - name: Parse repository safety scripts
+        shell: pwsh
+        run: ./Tools/RepoSafety/Test-RepoSafetyScripts.ps1
