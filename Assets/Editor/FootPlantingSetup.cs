@@ -86,4 +86,21 @@ public static class FootPlantingSetup
             $"已更新 {updated} 个 FootPlantingController 的释放参数并保存场景。\n请停止 Play 后重开验证（旧默认值不会自动更新，本操作即用于覆盖它们）。",
             "确定");
     }
+
+    [MenuItem("Mocap/Re-identify Standing Baseline")]
+    public static void ReidentifyBaseline()
+    {
+        var drivers = Object.FindObjectsOfType<HumanoidPoseDriver>();
+        if (drivers.Length == 0)
+        {
+            EditorUtility.DisplayDialog("Squat", "场景中没有 HumanoidPoseDriver。", "确定");
+            return;
+        }
+        foreach (var d in drivers)
+        {
+            d.ReidentifyStandingBaseline();
+        }
+        Debug.Log("[Squat] 已触发重新识别站立基准（请站直 0.6s）。");
+        EditorUtility.DisplayDialog("Squat", "已触发重新识别站立基准。\n请站直并保持约 0.6 秒（依赖有效新数据帧累计）。", "确定");
+    }
 }

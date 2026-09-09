@@ -54,8 +54,33 @@ public class HumanoidPoseDriver : MonoBehaviour
     public Quaternion LeftFootPlanned, RightFootPlanned;
     public bool LeftFootPlannedValid, RightFootPlannedValid;
 
+    [Header("Squat / Pelvis Height")]
+    [Tooltip("启用下蹲骨盆升降。需要 footIKActive 生效。")]
+    public bool enableSquat = true;
+    public float boardY = 0f;                      // 板面高度（骨盆/脚判定用）
+    public float squatRecognizeTime = 0.6f;        // 站立基准需持续的秒数(仅有效新帧)
+    public float squatMinVisibility = 0.65f;       // 站立识别最低关键点可见度
+    public float squatKneeAngleMin = 165f;         // 站立识别膝角下限(度)
+    [Range(0f, 0.9f)] public float squatMaxDescentRatio = 0.55f; // 最大下降 = 平均腿长 × 此值
+    public float squatSmoothTimeConst = 0.05f;     // 高度平滑时间常数(s)
+    public float squatMaxSpeed = 1.5f;             // 升降速度上限(m/s)
+    public float squatDeadzone = 0.01f;            // 高度死区(m)
+    [Tooltip("在 Inspector 勾选并手动触发一次“重新识别站立基准”")]
+    public bool reidentifyBaseline = false;
+
+    // 只读接口（供 FootPlantingController 等读取，避免各组件对同一帧不同判断）
+    public bool BaselineEstablished { get; private set; }
+    public float DescentMeters { get; private set; }
+    public float SquatTargetDescent { get; private set; }
+    public float LeftKneeAngleDeg { get; private set; }
+    public float RightKneeAngleDeg { get; private set; }
+    public bool SquatDataValid { get; private set; }
+    public bool SquatReachLimited { get; private set; }
+
     [Header("Debug")]
     public bool showBoneWarnings = true;
+    [Header("Squat Diagnostics")]
+    public bool showSquatOverlay = true;
 
     private Transform _hips, _spine, _chest, _upperChest, _head, _leftFoot, _rightFoot;
     private Quaternion _spineRestLocalRot, _chestRestLocalRot, _upperChestRestLocalRot;
@@ -69,6 +94,23 @@ public class HumanoidPoseDriver : MonoBehaviour
     private BasisRig _leftHandRig = new BasisRig(), _rightHandRig = new BasisRig();
     private FingerRigChain[] _leftFingers = new FingerRigChain[5];
     private FingerRigChain[] _rightFingers = new FingerRigChain[5];
+
+    // ── squat 内部状态 ──
+    private Transform _hipsParent;
+    private Vector3 _hipsBaseLocalPos;
+    private bool _hipsBaseCaptured;
+    private double _standTime;                // 有效新帧累计站立时间
+    private int _squatLastFrameId = -1;
+    private double _squatPrevTime = -1;
+    private float _H0;                        // 站立基准的腿伸展量(每帧重算自基准姿态的H0)
+    private float _smoothDescent;
+    private float _squatTargetDescent;
+    private bool _squatBaselineEstablished;
+    private float _leftH, _rightH;
+    private Vector3 _leftThighDir, _leftShinDir, _rightThighDir, _rightShinDir;
+    private float _leftThighLen, _leftShinLen, _rightThighLen, _rightShinLen;
+    private float _leftKneeDeg, _rightKneeDeg;
+    private Vector3 _lastPlannedL, _lastPlannedR;   // 上一帧已投影的计划脚位(判近地)
 
     private class BoneRig
     {
@@ -128,6 +170,13 @@ public class HumanoidPoseDriver : MonoBehaviour
         _chest = targetAnimator.GetBoneTransform(HumanBodyBones.Chest);
         _upperChest = targetAnimator.GetBoneTransform(HumanBodyBones.UpperChest);
         _head = targetAnimator.GetBoneTransform(HumanBodyBones.Head);
+
+        if (_hips != null)
+        {
+            _hipsParent = _hips.parent;
+            _hipsBaseLocalPos = _hips.localPosition;
+            _hipsBaseCaptured = true;
+        }
 
         if (_spine != null) _spineRestLocalRot = _spine.localRotation;
         if (_chest != null) _chestRestLocalRot = _chest.localRotation;
@@ -255,6 +304,12 @@ public class HumanoidPoseDriver : MonoBehaviour
     {
         if (receiver == null) return;
 
+        if (reidentifyBaseline)
+        {
+            reidentifyBaseline = false;
+            ReidentifyStandingBaseline();
+        }
+
         var frontPose = receiver.GetLatestPose();
         if (frontPose == null || frontPose.Count == 0) return;
 
@@ -281,13 +336,32 @@ public class HumanoidPoseDriver : MonoBehaviour
         ApplyLimbRigDual(_leftUpperArmRig,  _leftLowerArmRig,  frontPose, leftPose, "11", "13", "15", 0.3f);
         ApplyLimbRigDual(_rightUpperArmRig, _rightLowerArmRig, frontPose, leftPose, "12", "14", "16", 0.3f);
 
-        // ── 腿部：footIKActive 时只计算“独立 FK 计划值”，不写显示骨（交给 FootPlantingController）──
+        // ── 腿部：测量腿几何（下蹲/投影共用），不写显示骨，关节由 FootPlantingController 接管 ──
         HandleLeg(_leftUpperLegRig,  _leftLowerLegRig,  frontPose, leftPose, "23", "25", "27", legBlendWeight,
                   isLeftFoot: true,  ref PlannedLeftAnkle,  ref LeftUpperPlanned,  ref LeftLowerPlanned);
         HandleLeg(_rightUpperLegRig, _rightLowerLegRig, frontPose, leftPose, "24", "26", "28", legBlendWeight,
                   isLeftFoot: false, ref PlannedRightAnkle, ref RightUpperPlanned, ref RightLowerPlanned);
         PlannedLeftAnkle  = _leftUpperLegRig.bone != null ? PlannedLeftAnkle : Vector3.zero;
         PlannedRightAnkle = _rightUpperLegRig.bone != null ? PlannedRightAnkle : Vector3.zero;
+
+        // ── 下蹲：识别站立基准 → 目标下降量 → 平滑 → 应用骨盆(仅脚 IK 生效时) ──
+        if (footIKActive)
+        {
+            UpdateSquat(frontPose, Time.deltaTime);
+            ApplyPelvisOffset(Time.deltaTime);
+            // 应用骨盆后再投影独立踝位（FootPlantingController 读到骨盆修正后的脚位）
+            PlannedLeftAnkle = FKProjectAnkle(_leftUpperLegRig, _leftLowerLegRig,
+                                              LeftUpperPlanned, LeftLowerPlanned, _leftFootRig);
+            PlannedRightAnkle = FKProjectAnkle(_rightUpperLegRig, _rightLowerLegRig,
+                                               RightUpperPlanned, RightLowerPlanned, _rightFootRig);
+            _lastPlannedL = PlannedLeftAnkle;
+            _lastPlannedR = PlannedRightAnkle;
+        }
+        else
+        {
+            // 脚 IK 关闭 → 下蹲同步退出，恢复骨盆基准高度
+            RestoreHipsToBase();
+        }
 
         if (!footIKActive)
         {
@@ -319,16 +393,50 @@ public class HumanoidPoseDriver : MonoBehaviour
         upperPlanned = upperTarget;
         lowerPlanned = lowerTarget;
 
-        if (footIKActive)
-        {
-            // 只投影“独立踝位”，绝不写骨 → 反馈闭环切断
-            plannedAnkle = FKProjectAnkle(upperRig, lowerRig, upperTarget, lowerTarget,
-                                          isLeftFoot ? _leftFootRig : _rightFootRig);
-            return;
-        }
+        // 测量腿几何（独立于髋位置）：H 伸展量 + 膝角 + 世界骨长/方向（供下蹲 & 平面投影共用）
+        MeasureLeg(upperRig, lowerRig, upperTarget, lowerTarget, isLeftFoot);
 
-        ApplyBoneRig(upperRig, dirUpper, rotationSmooth);
-        ApplyBoneRig(lowerRig, dirLower, rotationSmooth);
+        plannedAnkle = Vector3.zero; // 投影推迟到 squat 应用骨盆后由 ProjectPlannedAnkles() 统一计算
+
+        if (!footIKActive)
+        {
+            ApplyBoneRig(upperRig, dirUpper, rotationSmooth);
+            ApplyBoneRig(lowerRig, dirLower, rotationSmooth);
+        }
+    }
+
+    /// <summary>测量单腿：世界大腿/小腿方向、骨长、H(垂直伸展量)、膝内角。不使用髋世界位置(保证独立)。</summary>
+    void MeasureLeg(BoneRig upperRig, BoneRig lowerRig,
+        Quaternion upperTarget, Quaternion lowerTarget, bool isLeft)
+    {
+        Transform up = upperRig.bone, low = lowerRig.bone;
+        if (up == null || low == null) return;
+        Quaternion upParentRot = up.parent != null ? up.parent.rotation : Quaternion.identity;
+        Quaternion upWorldRot = upParentRot * upperTarget;
+        Quaternion lowWorldRot = upWorldRot * lowerTarget;
+
+        Vector3 thighDir = upWorldRot * upperRig.restAxisLocal;
+        Vector3 shinDir = lowWorldRot * lowerRig.restAxisLocal;
+        float thighLen = low.localPosition.magnitude;
+        float shinLen = (isLeft ? _leftFootRig : _rightFootRig).bone != null
+            ? (isLeft ? _leftFootRig : _rightFootRig).bone.localPosition.magnitude
+            : 0.05f;
+
+        float H = -(thighLen * thighDir + shinLen * shinDir).y;   // 髋→踝垂直伸展(越直越大)
+        float kneeDeg = 180f - Vector3.Angle(thighDir, shinDir);  // 膝内角(站立≈180)
+
+        if (isLeft)
+        {
+            _leftThighDir = thighDir; _leftShinDir = shinDir;
+            _leftThighLen = thighLen; _leftShinLen = shinLen;
+            _leftH = H; _leftKneeDeg = kneeDeg;
+        }
+        else
+        {
+            _rightThighDir = thighDir; _rightShinDir = shinDir;
+            _rightThighLen = thighLen; _rightShinLen = shinLen;
+            _rightH = H; _rightKneeDeg = kneeDeg;
+        }
     }
 
     /// <summary>求一条腿的 上/下 世界方向（前摄 + 左摄加权），不写骨。方向分量会被归一化。</summary>
@@ -384,6 +492,143 @@ public class HumanoidPoseDriver : MonoBehaviour
             : low.localPosition;
         Vector3 ankleWorld = kneeWorld + lowWorldRot * ankleLocal;
         return ankleWorld;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // 下蹲：（仅脚 IK 生效时）站立基准识别 + 下降量估计 + 骨盆垂直偏移
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>识别站立基准 + 计算目标下降量（仅有效新帧更新；渲染帧只平滑）。</summary>
+    void UpdateSquat(Dictionary<string, Landmark> pose, float dt)
+    {
+        bool validData = false;
+        double frameDt = 0;
+        var recv = receiver;
+        if (recv != null)
+        {
+            if (recv.LatestFrameId != _squatLastFrameId)
+            {
+                double now = recv.LatestTime;
+                if (_squatPrevTime >= 0 && now > _squatPrevTime && now - _squatPrevTime > 1e-4)
+                {
+                    validData = true;
+                    frameDt = now - _squatPrevTime;
+                }
+                _squatPrevTime = now;
+                _squatLastFrameId = recv.LatestFrameId;
+            }
+        }
+
+        // 双膝可见度（前摄关键点 23,25,27 / 24,26,28）
+        float vis = float.MaxValue;
+        foreach (var k in new[] { "23", "25", "27", "24", "26", "28" })
+        {
+            if (pose.TryGetValue(k, out var lm)) vis = Mathf.Min(vis, lm.visibility);
+            else { vis = 0f; break; }
+        }
+
+        // 用“上一帧已投影”的计划脚位判接近地面（当前帧的 Planned* 在投影前为 0）
+        bool nearGround = (_lastPlannedL.y - boardY) <= 0.30f && (_lastPlannedR.y - boardY) <= 0.30f;
+        bool standing = vis >= squatMinVisibility &&
+                        _leftKneeDeg >= squatKneeAngleMin &&
+                        _rightKneeDeg >= squatKneeAngleMin &&
+                        nearGround;
+
+        if (validData)
+            _standTime = standing ? _standTime + frameDt : 0d;
+        SquatDataValid = validData && vis >= squatMinVisibility;
+
+        // 建立基准（连续满足 0.6s，且仅一次；不随动作自动更新）
+        if (!_squatBaselineEstablished && _standTime >= squatRecognizeTime && standing)
+        {
+            _H0 = (_leftH + _rightH) * 0.5f;
+            _squatBaselineEstablished = true;
+            _smoothDescent = 0f;
+            _squatTargetDescent = 0f;
+            Debug.Log("[Squat] ✅ 站立基准已建立.");
+        }
+        BaselineEstablished = _squatBaselineEstablished;
+        LeftKneeAngleDeg = _leftKneeDeg;
+        RightKneeAngleDeg = _rightKneeDeg;
+
+        // 计算目标下降量
+        if (_squatBaselineEstablished && SquatDataValid)
+        {
+            float avgLegLen = (_leftThighLen + _leftShinLen + _rightThighLen + _rightShinLen) * 0.25f;
+            float maxDescent = Mathf.Max(0.01f, avgLegLen * squatMaxDescentRatio);
+
+            bool leftOk = vis >= 0.30f;
+            bool rightOk = vis >= 0.30f;
+            float target = 0f;
+            if (leftOk && rightOk)
+            {
+                float dL = _H0 - _leftH;
+                float dR = _H0 - _rightH;
+                // 置信度加权（双支撑，均有效）
+                float wL = Mathf.Clamp01(vis);
+                float wR = Mathf.Clamp01(vis);
+                target = (dL * wL + dR * wR) / Mathf.Max(1e-4f, wL + wR);
+            }
+            else
+            {
+                // 单脚迈步/抬腿：保持已有下降量，不把抬膝当蹲
+                target = _smoothDescent;
+            }
+            target = Mathf.Clamp(target, 0f, maxDescent);
+
+            // 死区
+            if (target < squatDeadzone) target = 0f;
+
+            // 平滑目标（时间常数）
+            float a = 1f - Mathf.Exp(-dt / Mathf.Max(0.01f, squatSmoothTimeConst));
+            float smoothed = Mathf.Lerp(_smoothDescent, target, a);
+
+            // 升降速度上限
+            float maxStep = squatMaxSpeed * dt;
+            _smoothDescent = Mathf.MoveTowards(_smoothDescent, smoothed, maxStep);
+            _squatTargetDescent = target;
+        }
+        else
+        {
+            _squatTargetDescent = 0f;
+        }
+        DescentMeters = Mathf.Max(0f, _smoothDescent);
+    }
+
+    /// <summary>将骨盆 Hips 沿世界竖直方向下移（单写入者；不逐帧累加；不修改根/旋转）。</summary>
+    void ApplyPelvisOffset(float dt)
+    {
+        if (!_hipsBaseCaptured || _hips == null) return;
+        if (_squatBaselineEstablished)
+        {
+            Vector3 worldDown = Vector3.down;
+            Vector3 parentDown = _hipsParent != null ? _hipsParent.InverseTransformDirection(worldDown) : worldDown;
+            Vector3 targetLocal = _hipsBaseLocalPos + parentDown * DescentMeters;
+            _hips.localPosition = targetLocal;
+        }
+        else
+        {
+            RestoreHipsToBase();
+        }
+    }
+
+    void RestoreHipsToBase()
+    {
+        if (!_hipsBaseCaptured || _hips == null) return;
+        _hips.localPosition = _hipsBaseLocalPos;
+    }
+
+    /// <summary>Inspector 按钮：重新识别站立基准（清空基准与计时）。</summary>
+    public void ReidentifyStandingBaseline()
+    {
+        _squatBaselineEstablished = false;
+        _standTime = 0d;
+        _smoothDescent = 0f;
+        _squatTargetDescent = 0f;
+        _squatLastFrameId = -1;
+        _squatPrevTime = -1;
+        RestoreHipsToBase();
+        Debug.Log("[Squat] 重新识别站立基准已触发—请站直。");
     }
 
     /// <summary>返回目标局部旋转（不写骨）；等价 ApplyBoneRig 中的 targetLocalRot。</summary>
@@ -697,5 +942,21 @@ public class HumanoidPoseDriver : MonoBehaviour
         if (upHint.sqrMagnitude < 1e-6f) upHint = Vector3.ProjectOnPlane(Vector3.up, forward);
         if (upHint.sqrMagnitude < 1e-6f) return Quaternion.identity;
         return Quaternion.LookRotation(forward, upHint.normalized);
+    }
+
+    void OnGUI()
+    {
+        if (!showSquatOverlay || !footIKActive) return;
+        float x = 10, y = 90, w = 440, lh = 15;
+        GUI.Box(new Rect(x, y, w, lh * 6 + 8), "");
+        y += 4;
+        void L(string s) { GUI.Label(new Rect(x + 6, y, w - 12, lh), s); y += lh; }
+        string age = receiver != null && receiver.HasReceivedAny
+            ? receiver.LatestPacketAgeMs.ToString("F0") + " ms" : "--";
+        L($"[Squat] 基准={(_squatBaselineEstablished ? "已建立" : "未建立(等待站直0.6s)")}  数据帧龄={age}  (非端到端延迟)");
+        L($"  目标下降={_squatTargetDescent:F3}  实际下降={DescentMeters:F3} m");
+        L($"  左膝={_leftKneeDeg:F0}°  右膝={_rightKneeDeg:F0}°  (站立∈[165,180])");
+        L($"  可见度≥{squatMinVisibility:F2}={SquatDataValid}  (蹲姿时腿部可见度需保留)");
+        L($"  [勾选 enableSquat 生效；Mocap→Re-identify Standing Baseline 可重测基准]");
     }
 }
